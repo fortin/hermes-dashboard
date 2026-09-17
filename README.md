@@ -1,0 +1,196 @@
+# Hermes Dashboard
+
+A local macOS command center for the day: calendar, OmniFocus, Obsidian, email, and a Hermes agent in one browser page.
+
+The FastAPI backend binds to localhost, talks to your Mac apps over MCP (and Himalaya for mail), and serves a React UI. After a frontend build, the same process hosts the SPA at [http://127.0.0.1:8787](http://127.0.0.1:8787).
+
+## What it does
+
+The dashboard is a single-page layout, not a multi-route app.
+
+| Panel | What you get |
+| --- | --- |
+| **Ask Hermes** | Free-form questions about the day. The request is sent with today’s calendar, On Deck tasks, and local time. |
+| **Hermes Briefing** | A generated summary of the day (cached ~5 minutes). After 17:00 local, the panel switches to a next-day plan when one exists. |
+| **Email** | Unread and flagged mail from Himalaya accounts (`gmail`, `icloud`, `zoho`). Hermes triages priority and drafts replies; you can send, copy, or delete. |
+| **Daily note** | Today’s Obsidian note, created from your Daily Template if missing. Autosave with conflict detection; Dataview-style blocks are resolved approximately. |
+| **Quick Status** | OmniFocus inbox / overdue / flagged / On Deck counts. |
+| **Today** | Fantastical events for the current day. Click an event to open it in Fantastical. |
+| **On Deck** | The OmniFocus “On Deck” perspective. Complete with a 5-second undo, add a task, and pin items Hermes suggested in the briefing. |
+
+Times and “is the day done?” logic use **Asia/Bangkok**.
+
+### Briefing publish (optional)
+
+While the API is running, a background loop:
+
+1. Generates a briefing in morning / afternoon / evening slots (not before 07:00, not at night).
+2. Writes the markdown summary to `BRIEFING_NOTE_PATH` when that path is set.
+3. Sends a [Pushover](https://pushover.net/api) notification when both API keys are set, skipping pushes that are substantively the same as the last one.
+
+After 17:00 the loop will generate a next-day briefing if none is cached, then idle.
+
+## Architecture
+
+```
+Browser  ──►  FastAPI (:8787)  ──►  Hermes OpenAI-compatible API
+                 │                    (local gateway, default :8642)
+                 ├── PostgreSQL     cache, preferences, action journal
+                 ├── Fantastical    MCP (stdio)
+                 ├── OmniFocus      MCP (stdio)
+                 ├── Obsidian       MCP (streamable HTTP)
+                 ├── Himalaya CLI   email list / send / delete
+                 └── Pushover       optional briefing push
+```
+
+- **Backend:** Python 3.11+, FastAPI, SQLAlchemy + asyncpg
+- **Frontend:** React 19, Vite 8, TanStack Query; markdown via `react-markdown`
+- **Live updates:** `/api/events` SSE heartbeats refresh calendar about every two minutes and push a new briefing when one is generated. OmniFocus is **not** polled on a timer (OmniJS automation contends with Hermes).
+
+Production serving: if `frontend/dist` exists, FastAPI mounts `/assets` and falls back to `index.html` for the SPA.
+
+## Prerequisites
+
+This is a **local Mac** app. You need:
+
+| Dependency | Why |
+| --- | --- |
+| macOS | Fantastical MCP helper, OmniFocus, launchd |
+| Python 3.11+ | Backend |
+| Node.js + npm | Frontend build / Vite |
+| PostgreSQL | `hermesdashboard` database |
+| [Hermes](https://github.com/NousResearch/hermes-agent) gateway | Briefing + ask + email triage (`API_SERVER_ENABLED=true`) |
+| Fantastical | Built-in MCP binary (path in `.env`) |
+| OmniFocus + an OmniFocus MCP server | On Deck, status, complete/add |
+| Obsidian Local REST / MCP | Daily notes |
+| [Himalaya](https://github.com/pimalaya/himalaya) on `PATH` | Email triage (optional if you skip that panel) |
+
+Create the database once:
+
+```bash
+createdb hermesdashboard
+```
+
+Adjust `DATABASE_URL` if your Postgres role is not the default in `.env.example`.
+
+## Setup
+
+```bash
+git clone <this-repo>
+cd hermes-dashboard
+cp .env.example .env
+```
+
+Edit `.env` so every path, token, and URL matches **this machine**. Defaults in `backend/app/config.py` and `.env.example` are personal (vault folders, MCP binaries, Postgres user).
+
+### Backend
+
+```bash
+python3 -m venv backend/.venv
+source backend/.venv/bin/activate
+pip install -r backend/requirements.txt
+```
+
+`scripts/run.sh` creates this venv and installs requirements if they are missing.
+
+Dev tests:
+
+```bash
+pip install -r backend/requirements-dev.txt
+PYTHONPATH=backend pytest backend/tests
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run build    # writes frontend/dist for the FastAPI static server
+```
+
+Or use `scripts/build-frontend.sh` from the repo root.
+
+## Run
+
+**API + built UI** (what launchd uses):
+
+```bash
+./scripts/run.sh
+```
+
+Then open [http://127.0.0.1:8787](http://127.0.0.1:8787). Health check: `GET /api/health`.
+
+**Frontend hot reload** while the API is already on `:8787`:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Vite listens on [http://127.0.0.1:5173](http://127.0.0.1:5173) and proxies `/api` to the backend.
+
+### Start at login (launchd)
+
+The plist in `launchd/com.fortin.hermes-dashboard.plist` runs `scripts/run.sh` with `KeepAlive` and writes logs to `~/Library/Logs/hermes-dashboard.{out,err}.log`.
+
+Paths inside the plist are absolute for this checkout. After you confirm they are correct:
+
+```bash
+cp launchd/com.fortin.hermes-dashboard.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.fortin.hermes-dashboard.plist
+```
+
+Unload with `launchctl unload ~/Library/LaunchAgents/com.fortin.hermes-dashboard.plist`.
+
+## Environment
+
+Loaded from the repo-root `.env` via pydantic-settings. The dashboard binds **localhost only** by default.
+
+| Variable | Purpose |
+| --- | --- |
+| `DASHBOARD_HOST` / `DASHBOARD_PORT` | Bind address (default `127.0.0.1:8787`) |
+| `DATABASE_URL` | SQLAlchemy async URL (`postgresql+asyncpg://…`) |
+| `HERMES_BASE_URL` | OpenAI-compatible base, including `/v1` |
+| `HERMES_API_KEY` / `HERMES_MODEL` | Gateway auth and model name |
+| `OBSIDIAN_MCP_URL` / `OBSIDIAN_MCP_TOKEN` | Streamable HTTP MCP |
+| `OBSIDIAN_DAILY_FOLDER` | Vault-relative daily-note directory |
+| `OBSIDIAN_DAILY_FORMAT` | Filename pattern (e.g. `D-YYYY-MM-DD`) |
+| `OBSIDIAN_TEMPLATE_PATH` | Vault-relative Daily Template |
+| `OMNIFOCUS_MCP_COMMAND` | OmniFocus MCP executable |
+| `OMNIFOCUS_ON_DECK_PERSPECTIVE` | Perspective name for the task list |
+| `OMNIFOCUS_TOMORROW_PERSPECTIVE` | Used when building a next-day briefing |
+| `FANTASTICAL_MCP_COMMAND` | Fantastical MCP helper binary |
+| `PUSHOVER_USER_KEY` / `PUSHOVER_API_KEY` | Optional briefing notifications |
+| `BRIEFING_NOTE_PATH` | Optional markdown file written on each published briefing |
+| `KIKODO_CRM_*` | Optional CRM MCP paths (configured, not wired into the current UI) |
+
+Do not commit `.env`. Tokens for Hermes, Obsidian, Postgres, and Pushover live there.
+
+## API surface
+
+Routers are mounted under `/api`:
+
+- `GET /api/health`
+- `GET /api/calendar/today` and `GET /api/calendar?from=&to=`
+- `GET /api/tasks/on-deck`, `GET /api/tasks/status`, `POST /api/tasks`, `POST /api/tasks/{id}/complete`, `POST /api/tasks/{id}/incomplete`
+- `GET|PATCH /api/note/today`
+- `GET|POST /api/briefing` (`?force=true` regenerates)
+- `POST /api/agent/ask`
+- `GET|POST /api/email/triage`, `POST /api/email/send`, `POST /api/email/delete`
+- `POST /api/dataview/resolve`
+- `GET /api/widgets`, `GET /api/widgets/{id}`
+- `GET /api/events` (SSE)
+
+Task complete/incomplete writes are also recorded in the `action_journal` table when Postgres is up; a journal failure does not block OmniFocus.
+
+## Layout
+
+```
+backend/app/          FastAPI app, routers, MCP client, services
+backend/tests/        pytest
+frontend/src/          React UI
+scripts/run.sh         venv + uvicorn
+scripts/build-frontend.sh
+launchd/               launch agent plist
+.env.example           template for local secrets and paths
+```
