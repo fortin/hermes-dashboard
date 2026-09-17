@@ -1,0 +1,14 @@
+.env
+.venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+.Python
+frontend/node_modules/
+frontend/dist/
+*.egg-info/
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+*.log
+.ruff_cache/
