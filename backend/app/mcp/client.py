@@ -31,6 +31,24 @@ class McpServerHandle:
         await self._stack.aclose()
 
 
+def is_cancel_scope_noise(exc: BaseException, _seen: set[int] | None = None) -> bool:
+    """True for anyio/MCP shutdown when close runs on a different task than open."""
+    seen = _seen if _seen is not None else set()
+    ident = id(exc)
+    if ident in seen:
+        return False
+    seen.add(ident)
+    if "cancel scope" in str(exc).lower():
+        return True
+    for inner in getattr(exc, "exceptions", ()) or ():
+        if isinstance(inner, BaseException) and is_cancel_scope_noise(inner, seen):
+            return True
+    for linked in (exc.__cause__, exc.__context__):
+        if isinstance(linked, BaseException) and is_cancel_scope_noise(linked, seen):
+            return True
+    return False
+
+
 def _normalize_tool_result(result: Any) -> Any:
     if getattr(result, "isError", False):
         parts = []
@@ -127,8 +145,11 @@ class McpRegistry:
         for name, handle in list(self._servers.items()):
             try:
                 await handle.close()
-            except Exception:  # noqa: BLE001
-                logger.exception("Error closing MCP server %s", name)
+            except BaseException as exc:
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                if not is_cancel_scope_noise(exc):
+                    logger.exception("Error closing MCP server %s", name)
             self._servers.pop(name, None)
 
 
