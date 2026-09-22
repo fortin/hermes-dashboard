@@ -14,9 +14,7 @@ from ..config import get_settings
 logger = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Bangkok")
 
-VAULT_ROOT = Path(
-    "/Users/antonio/Library/Mobile Documents/iCloud~md~obsidian/Documents/My Vault"
-)
+VAULT_ROOT = Path("/Users/antonio/Obsidian/My Vault")
 
 
 def _completed_tasks_from_note(content: str) -> list[str]:
