@@ -476,6 +476,32 @@ textarea {
   margin-right: 0.45rem;
 }
 
+.markdown.briefing-body h1,
+.markdown.briefing-body h2,
+.markdown.briefing-body h3,
+.markdown.briefing-body h4 {
+  font-family: var(--font-body);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0.9em 0 0.28em;
+}
+
+.markdown.briefing-body ul,
+.markdown.briefing-body ol {
+  margin: 0.15em 0 0.35em;
+}
+
+.markdown.briefing-body li + li {
+  margin-top: 0.18em;
+}
+
+.markdown.briefing-body p {
+  margin: 0.7em 0;
+}
+
 .note-preview {
   max-height: min(70vh, 720px);
   overflow-y: auto;

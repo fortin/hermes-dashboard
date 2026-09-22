@@ -11,19 +11,23 @@ from .config import get_settings
 from .db import init_db
 from .mcp.client import registry
 from .routers import agent, calendar, daily_note, email, tasks, widgets
-from .services import briefing_push
+from .services import briefing_push, omnifocus_agent
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await init_db()
     push_task = asyncio.create_task(briefing_push.run_loop())
+    gladys_task = asyncio.create_task(omnifocus_agent.run_loop())
     try:
         yield
     finally:
         push_task.cancel()
+        gladys_task.cancel()
         with suppress(asyncio.CancelledError):
             await push_task
+        with suppress(asyncio.CancelledError):
+            await gladys_task
         await registry.close_all()
 
 

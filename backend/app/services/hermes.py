@@ -42,12 +42,20 @@ _FAILED_REPLY_MARKERS = (
     "empty stream",
     "interrupted during api call",
 )
-# Hermes itself waits up to HERMES_API_TIMEOUT (1800s) / 900s stream-stale.
-# The dashboard used to use connect=3s + read=180s; httpcore timeouts stringify
-# as empty, so the UI showed "Cannot reach …:" and gave up while llama was still
-# prefilling a ~22k-token agent prompt.
+# Hermes itself also has HERMES_API_TIMEOUT (see ~/.hermes/.env). Gladys uses a
+# separate read timeout so overnight OmniFocus jobs are not cut at 30 minutes.
 _HERMES_TIMEOUT = httpx.Timeout(connect=15.0, read=900.0, write=30.0, pool=15.0)
 _TRANSIENT_HTTP = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_DELEGATED_SYSTEM = (
+    "You are Gladys, Antonio's Hermes agent. He assigned you an OmniFocus task "
+    "to execute in the background. Use your tools and do the work. Do not "
+    "produce a daily briefing or tell him what he should do next.\n"
+    "If the work should run later or repeat, schedule it with the cronjob tool "
+    "(deliver='telegram' so results reach him). Then STATUS: done.\n"
+    "When finished, write a short receipt: what changed, where artifacts live, "
+    "and commit hashes if any. End with exactly one line: STATUS: done, "
+    "STATUS: blocked, or STATUS: failed. If blocked, say what you need from him."
+)
 
 
 class HermesUnavailable(Exception):
@@ -150,10 +158,52 @@ def day_is_done(calendar: list[dict[str, Any]], now: dict[str, Any]) -> bool:
     return int(hour) >= _DAY_DONE_HOUR
 
 
+_IGNORED_HOLIDAY_CALENDARS = frozenset(
+    {
+        "jewish holidays",
+        "public holidays and observances",
+        "holidays in the united kingdom",
+        "holidays in united kingdom",
+        "holidays in switzerland",
+        "holidays in spain",
+        "thai holidays",
+        "us holidays",
+    }
+)
+_THE_RE = re.compile(r"\bthe\b")
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _calendar_key(name: str) -> str:
+    text = _THE_RE.sub(" ", name.strip().lower())
+    return _SPACE_RE.sub(" ", text).strip()
+
+
+_IGNORED_HOLIDAY_KEYS = frozenset(
+    _calendar_key(item) for item in _IGNORED_HOLIDAY_CALENDARS
+)
+
+
+def is_ignored_holiday_calendar(name: Any) -> bool:
+    if not name:
+        return False
+    leaf = str(name).replace("\\", "/").split("/")[-1].split(":")[-1]
+    key = _calendar_key(leaf)
+    if key in _IGNORED_HOLIDAY_KEYS:
+        return True
+    return (
+        key.startswith("holidays in ")
+        or key.startswith("public holidays")
+        or key.endswith(" holidays")
+    )
+
+
 def enrich_calendar_for_prompt(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Add unambiguous local weekday/time labels so Hermes cannot invent schedules."""
     enriched: list[dict[str, Any]] = []
     for raw in events:
+        if is_ignored_holiday_calendar(raw.get("calendar")):
+            continue
         if "start_local" in raw and "weekday" in raw:
             enriched.append(raw)
             continue
@@ -198,12 +248,36 @@ def _datetime_rules(now: dict[str, Any]) -> str:
         "Rules you MUST follow:\n"
         "1. Do not invent weekday, date, or religious timing. Never say Shabbat is "
         "starting tonight unless is_shabbat is true or the clock is Friday evening.\n"
-        "2. Jewish calendar / Hebcal items (fasts, festivals) are NOT Shabbat unless "
-        "their title literally says Shabbat/Shabbos and the weekday matches.\n"
+        "2. Holiday calendars are omitted from the snapshot (Jewish, Thai, UK, Swiss, "
+        "Spanish, and generic public holidays). Do not mention those holidays, fasts, "
+        "or observances, and do not treat them as Shabbat.\n"
         "3. Only mention calendar events listed in the snapshot, with their listed "
         "weekday and times. Do not add holidays or candle-lighting times that are "
         "not listed.\n"
         "4. Match tone to the actual time_of_day; never write a morning briefing at night."
+    )
+
+
+def hermes_busy() -> bool:
+    return _hermes_lock.locked()
+
+
+def delegated_task_timeout() -> httpx.Timeout:
+    """Read timeout for Gladys OmniFocus jobs. 0/negative means no read deadline."""
+    seconds = int(getattr(get_settings(), "omnifocus_agent_timeout_seconds", 0) or 0)
+    read: float | None = None if seconds <= 0 else float(seconds)
+    return httpx.Timeout(connect=15.0, read=read, write=30.0, pool=15.0)
+
+
+async def execute_delegated_task(message: str) -> AgentReply:
+    """Long-running OmniFocus assignment. Shares the gateway lock with Ask Hermes."""
+    now = local_now_context()
+    return await ask_hermes(
+        message,
+        include_snapshot=False,
+        max_attempts=2,
+        system=f"{_DELEGATED_SYSTEM}\n\n{_datetime_rules(now)}",
+        timeout=delegated_task_timeout(),
     )
 
 
@@ -213,6 +287,8 @@ async def ask_hermes(
     *,
     max_attempts: int = 5,
     include_snapshot: bool = True,
+    system: str | None = None,
+    timeout: httpx.Timeout | None = None,
 ) -> AgentReply:
     settings = get_settings()
     now = local_now_context()
@@ -223,14 +299,15 @@ async def ask_hermes(
         )
     snapshot["now"] = now
 
-    system = (
-        "You are Hermes embedded in Antonio's local day dashboard. "
-        "Prefer concrete, actionable advice. Keep replies concise unless asked "
-        "for detail.\n\n"
-        f"{_datetime_rules(now)}\n"
-        "Trust the dashboard snapshot's now + calendar over any other sense of "
-        "what day it is. If tools disagree with the snapshot clock, the snapshot wins."
-    )
+    if system is None:
+        system = (
+            "You are Hermes embedded in Antonio's local day dashboard. "
+            "Prefer concrete, actionable advice. Keep replies concise unless asked "
+            "for detail.\n\n"
+            f"{_datetime_rules(now)}\n"
+            "Trust the dashboard snapshot's now + calendar over any other sense of "
+            "what day it is. If tools disagree with the snapshot clock, the snapshot wins."
+        )
     if include_snapshot:
         system += "\n\nCurrent dashboard snapshot (JSON):\n" + json.dumps(
             snapshot, default=str
@@ -256,7 +333,7 @@ async def ask_hermes(
         async with _hermes_lock:
             started = time.monotonic()
             try:
-                async with httpx.AsyncClient(timeout=_HERMES_TIMEOUT) as client:
+                async with httpx.AsyncClient(timeout=timeout or _HERMES_TIMEOUT) as client:
                     resp = await client.post(url, headers=headers, json=payload)
             except _TRANSIENT_HTTP as exc:
                 elapsed = time.monotonic() - started
@@ -321,24 +398,66 @@ async def ask_hermes(
     raise HermesUnavailable(last_error, retryable=True)
 
 
+_JSON_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _escape_raw_controls_in_json_strings(text: str) -> str:
+    """Turn raw newlines/tabs inside JSON strings into valid escapes."""
+    out: list[str] = []
+    in_str = False
+    escape = False
+    for ch in text:
+        if in_str:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_str = False
+                continue
+            escaped = _JSON_CONTROL_ESCAPES.get(ch)
+            if escaped is not None:
+                out.append(escaped)
+                continue
+            if ord(ch) < 32:
+                out.append(f"\\u{ord(ch):04x}")
+                continue
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_str = True
+        out.append(ch)
+    return "".join(out)
+
+
+def _loads_json_object(text: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = json.loads(_escape_raw_controls_in_json_strings(text))
+    if not isinstance(parsed, dict):
+        raise json.JSONDecodeError("JSON was not an object", text, 0)
+    return parsed
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
+        return _loads_json_object(text)
     except json.JSONDecodeError:
         pass
     m = re.search(r"\{[\s\S]*\}", text)
     if not m:
         raise json.JSONDecodeError("No JSON object", text, 0)
-    parsed = json.loads(m.group(0))
-    if not isinstance(parsed, dict):
-        raise json.JSONDecodeError("JSON was not an object", text, 0)
-    return parsed
+    return _loads_json_object(m.group(0))
 
 
 def _task_id(task: dict[str, Any]) -> str:
@@ -587,7 +706,12 @@ def peek_briefing() -> Briefing | None:
     now = local_now_context()
     if int(now.get("hour") or 0) >= _DAY_DONE_HOUR:
         return _nextday_for(str(now.get("date") or ""))
-    return _fresh_cached_briefing(force=False)
+    fresh = _fresh_cached_briefing(force=False)
+    if fresh is not None:
+        return fresh
+    if hermes_busy():
+        return _last_good_briefing()
+    return None
 
 
 def _served_cache(context: dict[str, Any], now: dict[str, Any]) -> Briefing | None:
@@ -669,6 +793,20 @@ async def generate_briefing(
         return await _generate_briefing_locked(context, force=force, now=now)
 
 
+_BRIEFING_LAYOUT = (
+    "Write the same kind of briefing as before — full sentences, with reasons — "
+    "but as short markdown paragraphs, not one run-on block and not a labelled "
+    "inventory. Start with **weekday date** on its own line. Then 2-4 short "
+    "paragraphs: timed commitments in order and where the free blocks are; "
+    "best use of the main free block (name the task, due/defer/planned date, "
+    "and why it fits or what it sets up); other realistic tasks, each with a "
+    "reason. Bold recommended task names. A short bullet list is fine only for "
+    "several sibling recommendations, and each bullet must still be a full "
+    "sentence with a reason. Do not use labelled section headings. "
+    "No preamble, no pep talk. Aim for 100-160 words."
+)
+
+
 def _briefing_prompt(
     now: dict[str, Any],
     cal: list[dict[str, Any]],
@@ -679,7 +817,7 @@ def _briefing_prompt(
 ) -> str:
     json_shape = (
         "Return ONLY JSON with this shape:\n"
-        '{"summary":"markdown, max 120 words, no preamble",'
+        '{"summary":"markdown prose in short paragraphs; escape newlines as \\n",'
         '"suggested_task_ids":["id"]}\n'
         "suggested_task_ids must be 1-3 ids copied exactly from the task "
         "list above, in the order Antonio should do them next. Use [] if none. "
@@ -698,6 +836,7 @@ def _briefing_prompt(
             "realistic before the next timed commitment, and one suggested focus. "
             "Do not mention Shabbat, candle lighting, or breaking a fast unless "
             "those times appear explicitly in the calendar list above for today.\n\n"
+            f"{_BRIEFING_LAYOUT}\n\n"
             f"{json_shape}"
         )
     return (
@@ -717,6 +856,7 @@ def _briefing_prompt(
         "is no work tomorrow. Name tomorrow's weekday. Do not say those events "
         "are today. Do not mention Shabbat, candle lighting, or breaking a fast "
         "unless those times appear explicitly in tomorrow's calendar list.\n\n"
+        f"{_BRIEFING_LAYOUT}\n\n"
         f"{json_shape}"
     )
 
@@ -817,6 +957,7 @@ async def _generate_briefing_locked(
         last = _last_good_briefing()
         if last is not None:
             logger.warning("Briefing Hermes failed (%s); returning last good", exc)
+            _briefing_cache = (time.monotonic(), last)
             return last
 
         return Briefing(

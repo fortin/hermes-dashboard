@@ -9,8 +9,10 @@ from unittest.mock import patch
 from app.models.schemas import AgentReply, Briefing
 from app.services import hermes
 from app.services.hermes import (
+    _briefing_prompt,
     day_is_done,
     describe_http_error,
+    enrich_calendar_for_prompt,
     parse_briefing_reply,
     pin_suggested_tasks,
 )
@@ -85,6 +87,79 @@ class ParseBriefingReplyTests(unittest.TestCase):
         )
         self.assertEqual(ids, ["ccc"])
 
+    def test_keeps_multiline_markdown_summary(self):
+        summary, ids = parse_briefing_reply(
+            json.dumps(
+                {
+                    "summary": (
+                        "**Thursday 17 September**\n\n"
+                        "Lunch is at 13:00, then Caroline class 15:00–16:00.\n\n"
+                        "Best use of the morning: **Draft Kikodo proposal** "
+                        "(planned 07:00), which sets up the afternoon meeting."
+                    ),
+                    "suggested_task_ids": ["bbb"],
+                }
+            ),
+            TASKS,
+        )
+        self.assertIn("Lunch is at 13:00", summary)
+        self.assertIn("**Draft Kikodo proposal**", summary)
+        self.assertIn("which sets up the afternoon meeting", summary)
+        self.assertEqual(ids, ["bbb"])
+
+    def test_recovers_summary_when_json_has_raw_newlines(self):
+        raw = (
+            '{\n'
+            '  "summary": "**Thursday**\n'
+            '\n'
+            'Best use of the morning: Draft Kikodo proposal, which sets up the meeting.",\n'
+            '  "suggested_task_ids": ["bbb"]\n'
+            '}'
+        )
+        summary, ids = parse_briefing_reply(raw, TASKS)
+        self.assertTrue(summary.startswith("**Thursday**"))
+        self.assertIn("Draft Kikodo proposal", summary)
+        self.assertIn("which sets up the meeting", summary)
+        self.assertNotIn("suggested_task_ids", summary)
+        self.assertEqual(ids, ["bbb"])
+
+
+class BriefingPromptFormatTests(unittest.TestCase):
+    def test_today_prompt_asks_for_short_prose_paragraphs(self):
+        prompt = _briefing_prompt(
+            NOW_MORNING,
+            [{"title": "Lunch", "start": "2026-09-17T13:00:00+07:00"}],
+            [{"id": "bbb", "name": "Draft Kikodo proposal"}],
+            tomorrow=None,
+            tomorrow_cal=None,
+        )
+        self.assertIn("short markdown paragraphs", prompt)
+        self.assertIn("full sentences, with reasons", prompt)
+        self.assertIn("not a labelled inventory", prompt)
+        self.assertIn("Do not use labelled section headings", prompt)
+        self.assertNotIn("max 120 words, no preamble", prompt)
+
+    def test_tomorrow_prompt_asks_for_the_same_prose(self):
+        with patch.object(
+            hermes,
+            "get_settings",
+            return_value=type("S", (), {"omnifocus_tomorrow_perspective": "Forecast"})(),
+        ):
+            prompt = _briefing_prompt(
+                NOW_EVENING,
+                [],
+                [{"id": "bbb", "name": "Draft Kikodo proposal"}],
+                tomorrow={
+                    "weekday": "Friday",
+                    "date": "2026-09-18",
+                    "human": "Friday 18 September 2026",
+                },
+                tomorrow_cal=[{"title": "Caroline class"}],
+            )
+        self.assertIn("short markdown paragraphs", prompt)
+        self.assertIn("full sentences, with reasons", prompt)
+        self.assertIn("Forecast", prompt)
+
 
 class PinSuggestedTasksTests(unittest.TestCase):
     def test_pins_suggested_in_briefing_order(self):
@@ -126,6 +201,26 @@ class FailedModelReplyTests(unittest.TestCase):
         self.assertFalse(hermes.is_failed_model_reply("Focus on the Kikodo proposal."))
 
 
+class DelegatedTaskTimeoutTests(unittest.TestCase):
+    def test_zero_means_no_read_deadline(self):
+        with patch.object(
+            hermes,
+            "get_settings",
+            return_value=type("S", (), {"omnifocus_agent_timeout_seconds": 0})(),
+        ):
+            timeout = hermes.delegated_task_timeout()
+        self.assertIsNone(timeout.read)
+
+    def test_positive_seconds_set_read_deadline(self):
+        with patch.object(
+            hermes,
+            "get_settings",
+            return_value=type("S", (), {"omnifocus_agent_timeout_seconds": 43200})(),
+        ):
+            timeout = hermes.delegated_task_timeout()
+        self.assertEqual(timeout.read, 43200.0)
+
+
 class DayIsDoneTests(unittest.TestCase):
     def test_morning_is_not_done(self):
         self.assertFalse(day_is_done([], NOW_MORNING))
@@ -165,6 +260,126 @@ class DayIsDoneTests(unittest.TestCase):
             }
         ]
         self.assertTrue(day_is_done(calendar, NOW_EVENING))
+
+
+class HolidayCalendarFilterTests(unittest.TestCase):
+    def test_drops_named_holiday_calendars(self):
+        events = [
+            {
+                "title": "Rosh Hashanah",
+                "start": "2026-09-19T00:00:00+07:00",
+                "end": "2026-09-20T00:00:00+07:00",
+                "all_day": True,
+                "calendar": "Jewish Holidays",
+            },
+            {
+                "title": "Bank Holiday",
+                "start": "2026-09-19T00:00:00+07:00",
+                "end": "2026-09-20T00:00:00+07:00",
+                "all_day": True,
+                "calendar": "Holidays in the United Kingdom",
+            },
+            {
+                "title": "National Day",
+                "start": "2026-09-19T00:00:00+07:00",
+                "end": "2026-09-20T00:00:00+07:00",
+                "all_day": True,
+                "calendar": "Holidays in Switzerland",
+            },
+            {
+                "title": "Fiesta",
+                "start": "2026-09-19T00:00:00+07:00",
+                "end": "2026-09-20T00:00:00+07:00",
+                "all_day": True,
+                "calendar": "Holidays in Spain",
+            },
+            {
+                "title": "Songkran",
+                "start": "2026-09-19T00:00:00+07:00",
+                "end": "2026-09-20T00:00:00+07:00",
+                "all_day": True,
+                "calendar": "Thai Holidays",
+            },
+            {
+                "title": "Observance",
+                "start": "2026-09-19T00:00:00+07:00",
+                "end": "2026-09-20T00:00:00+07:00",
+                "all_day": True,
+                "calendar": "Public Holidays and Observances",
+            },
+            {
+                "title": "Caroline class",
+                "start": "2026-09-19T16:00:00+07:00",
+                "end": "2026-09-19T17:00:00+07:00",
+                "all_day": False,
+                "calendar": "Family",
+            },
+        ]
+        kept = enrich_calendar_for_prompt(events)
+        self.assertEqual([e["title"] for e in kept], ["Caroline class"])
+
+    def test_drops_uk_calendar_without_the(self):
+        kept = enrich_calendar_for_prompt(
+            [
+                {
+                    "title": "Bank Holiday",
+                    "start": "2026-09-20T00:00:00+07:00",
+                    "end": "2026-09-21T00:00:00+07:00",
+                    "all_day": True,
+                    "calendar": "Holidays in United Kingdom",
+                }
+            ]
+        )
+        self.assertEqual(kept, [])
+
+    def test_drops_us_holidays_suffix(self):
+        kept = enrich_calendar_for_prompt(
+            [
+                {
+                    "title": "Independence Day",
+                    "start": "2026-09-20T00:00:00+07:00",
+                    "end": "2026-09-21T00:00:00+07:00",
+                    "all_day": True,
+                    "calendar": "US Holidays",
+                }
+            ]
+        )
+        self.assertEqual(kept, [])
+
+    def test_drops_account_prefixed_holiday_calendar(self):
+        kept = enrich_calendar_for_prompt(
+            [
+                {
+                    "title": "Yom Kippur",
+                    "start": "2026-09-19T00:00:00+07:00",
+                    "end": "2026-09-20T00:00:00+07:00",
+                    "all_day": True,
+                    "calendar": "iCloud / Jewish Holidays",
+                }
+            ]
+        )
+        self.assertEqual(kept, [])
+
+    def test_drops_erev_once_calendar_title_is_resolved(self):
+        kept = enrich_calendar_for_prompt(
+            [
+                {
+                    "title": "Erev Yom Kippur",
+                    "start": "2026-09-20T00:00:00+07:00",
+                    "end": "2026-09-21T00:00:00+07:00",
+                    "all_day": True,
+                    "calendar": "Jewish Holidays",
+                },
+                {
+                    "title": "Weekly Review",
+                    "start": "2026-09-20T19:00:00+07:00",
+                    "end": "2026-09-20T20:00:00+07:00",
+                    "all_day": False,
+                    "calendar": "Personal",
+                },
+            ]
+        )
+        self.assertEqual([e["title"] for e in kept], ["Weekly Review"])
 
 
 class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
@@ -310,6 +525,56 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(briefing.summary, "Focus on the ad.")
         self.assertEqual(briefing.source, "hermes")
         spawn.assert_not_called()
+
+    async def test_connect_failure_recaches_last_good(self):
+        last = Briefing(
+            summary="Focus on the ad.",
+            generated_at="2026-09-17T08:05:00+07:00",
+            source="hermes",
+            suggested_task_ids=[],
+        )
+        hermes._briefing_cache = (0.0, last)
+        calls = 0
+
+        async def fake_ask(*_a, **_k):
+            nonlocal calls
+            calls += 1
+            raise hermes.HermesUnavailable(
+                "Cannot reach Hermes API at http://127.0.0.1:8642/v1 "
+                "after 0.0s (ConnectError: All connection attempts failed)"
+            )
+
+        with (
+            patch.object(hermes, "ask_hermes", fake_ask),
+            patch.object(hermes, "_spawn_publish") as spawn,
+        ):
+            first = await hermes.generate_briefing(
+                {"calendar": [], "tasks": []},
+                force=True,
+            )
+            second = await hermes.generate_briefing(
+                {"calendar": [], "tasks": []},
+                force=False,
+            )
+        self.assertEqual(calls, 1)
+        self.assertEqual(first.summary, "Focus on the ad.")
+        self.assertEqual(second.summary, first.summary)
+        spawn.assert_not_called()
+
+    async def test_peek_serves_stale_last_good_while_hermes_busy(self):
+        hermes._briefing_cache = (
+            0.0,
+            Briefing(
+                summary="Focus on the ad.",
+                generated_at="2026-09-17T08:05:00+07:00",
+                source="hermes",
+            ),
+        )
+        self.assertIsNone(hermes.peek_briefing())
+        async with hermes._hermes_lock:
+            peeked = hermes.peek_briefing()
+        self.assertIsNotNone(peeked)
+        self.assertEqual(peeked.summary, "Focus on the ad.")
 
     async def test_persists_last_good(self):
         async def fake_ask(*_a, **_k):

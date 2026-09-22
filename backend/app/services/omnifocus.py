@@ -57,10 +57,22 @@ def _as_tasks(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _tag_label(raw: Any) -> str | None:
+    if isinstance(raw, str):
+        text = raw.strip()
+        return text or None
+    if isinstance(raw, dict):
+        name = raw.get("name") or raw.get("title")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
 def _normalize_task(raw: dict[str, Any]) -> TaskItem:
     tags = raw.get("tags") or raw.get("tagNames") or []
     if isinstance(tags, str):
         tags = [tags]
+    tag_labels = [label for label in (_tag_label(t) for t in tags) if label]
     project = (
         raw.get("project")
         or raw.get("projectName")
@@ -68,6 +80,9 @@ def _normalize_task(raw: dict[str, Any]) -> TaskItem:
     )
     if isinstance(project, dict):
         project = project.get("name") or project.get("title")
+    project_id = raw.get("projectId") or raw.get("project_id")
+    if isinstance(project_id, dict):
+        project_id = project_id.get("id")
     return TaskItem(
         id=str(raw.get("id") or raw.get("taskId") or ""),
         name=str(raw.get("name") or raw.get("title") or "Untitled"),
@@ -78,12 +93,13 @@ def _normalize_task(raw: dict[str, Any]) -> TaskItem:
         ),
         flagged=bool(raw.get("flagged")),
         project=str(project) if project else None,
+        project_id=str(project_id) if project_id else None,
         due=raw.get("due") or raw.get("dueDate"),
         defer=raw.get("defer") or raw.get("deferDate"),
         planned=raw.get("planned") or raw.get("plannedDate"),
         estimated_minutes=raw.get("estimatedMinutes") or raw.get("estimated_minutes"),
         note=raw.get("note") or raw.get("notes"),
-        tags=[str(t) for t in tags],
+        tags=tag_labels,
     )
 
 
@@ -149,13 +165,116 @@ async def incomplete_task(task_id: str) -> dict[str, Any]:
     return result
 
 
-async def add_task(name: str, note: str | None = None) -> dict[str, Any]:
+async def add_task(
+    name: str,
+    note: str | None = None,
+    *,
+    tags: list[str] | None = None,
+    defer_date: str | None = None,
+    project_id: str | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
     args: dict[str, Any] = {"name": name}
     if note:
         args["note"] = note
+    if tags:
+        args["tags"] = tags
+    if defer_date:
+        args["defer_date"] = defer_date
+    if project_id:
+        args["project_id"] = project_id
+    elif project_name:
+        args["project_name"] = project_name
     result = await _call("add_task", args)
     invalidate_cache()
     return result
+
+
+def created_task_id(payload: Any) -> str | None:
+    for raw in _as_tasks(payload):
+        tid = raw.get("id") or raw.get("taskId")
+        if tid:
+            return str(tid)
+    return None
+
+
+async def get_tagged_tasks(tag_name: str, limit: int = 50) -> list[TaskItem]:
+    raw = await _call(
+        "query_tasks",
+        {
+            "source": "tag",
+            "tag_name": tag_name,
+            "hide_completed": True,
+            "limit": limit,
+            "output": "detailed",
+            "exact_match": True,
+        },
+    )
+    return [_normalize_task(t) for t in _as_tasks(raw) if t.get("id")]
+
+
+async def set_task_tags(task_id: str, tags: list[str]) -> dict[str, Any]:
+    result = await _call(
+        "edit_item",
+        {
+            "item_type": "task",
+            "id": task_id,
+            "tags": tags,
+            "replace_tags": True,
+        },
+    )
+    invalidate_cache()
+    return result
+
+
+async def append_task_note(task_id: str, text: str) -> dict[str, Any]:
+    result = await _call(
+        "append_note",
+        {"item_type": "task", "id": task_id, "text": text},
+    )
+    invalidate_cache()
+    return result
+
+
+async def set_task_flagged(task_id: str, flagged: bool) -> dict[str, Any]:
+    result = await _call(
+        "edit_item",
+        {"item_type": "task", "id": task_id, "flagged": flagged},
+    )
+    invalidate_cache()
+    return result
+
+
+def _as_tags(payload: Any) -> list[dict[str, Any]]:
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], (dict, list)):
+            return _as_tags(payload["data"])
+        for key in ("tags", "items", "results"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+    return []
+
+
+async def list_tag_names(limit: int = 200) -> set[str]:
+    raw = await _call("query_tags", {"output": "compact", "limit": limit})
+    names: set[str] = set()
+    for item in _as_tags(raw):
+        label = _tag_label(item)
+        if label:
+            names.add(label)
+    return names
+
+
+async def add_tag(name: str, parent_name: str | None = None) -> dict[str, Any]:
+    args: dict[str, Any] = {"action": "add", "name": name}
+    if parent_name:
+        args["parent_tag_name"] = parent_name
+    return await _call("manage_tag", args)
 
 
 def _extract_count(raw: Any) -> int | None:

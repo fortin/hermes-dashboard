@@ -10,7 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..models.schemas import EmailTriageItem, EmailTriageResponse
-from .hermes import HermesUnavailable, ask_hermes
+from .hermes import HermesUnavailable, ask_hermes, hermes_busy
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,53 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         return json.loads(m.group(0))
 
 
+def _fallback_reason(exc: BaseException | None = None) -> str:
+    if hermes_busy():
+        return "Hermes busy — heuristic triage only"
+    text = str(exc or "").lower()
+    if "cannot reach" in text or "connect" in text:
+        return "Hermes offline — heuristic triage only"
+    return "Hermes unavailable — heuristic triage only"
+
+
+def _heuristic_triage(
+    envelopes: list[dict[str, Any]],
+    *,
+    reason: str,
+) -> EmailTriageResponse:
+    items: list[EmailTriageItem] = []
+    for env in envelopes:
+        subject = (env.get("subject") or "").lower()
+        sender = (env.get("from") or "").lower()
+        noise_hints = (
+            "unsubscribe",
+            "newsletter",
+            "noreply",
+            "no-reply",
+            "digest",
+            "invoice",
+            "receipt",
+            "onboarding",
+        )
+        is_noise = any(h in subject or h in sender for h in noise_hints)
+        items.append(
+            EmailTriageItem(
+                id=env["id"],
+                account=env["account"],
+                subject=env["subject"],
+                sender=env["from"],
+                date=env["date"],
+                priority="noise" if is_noise else "medium",
+                disposition="noise" if is_noise else "reference",
+                reason=reason,
+                needs_reply=False,
+                draft_reply=None,
+                snippet=env.get("snippet") or "",
+            )
+        )
+    return EmailTriageResponse(items=items, source="fallback")
+
+
 async def triage_inbox(force: bool = False) -> EmailTriageResponse:
     global _triage_cache
     if not force and _triage_cache is not None:
@@ -213,6 +260,9 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
         "Draft replies only when a human reply is actually warranted. "
         "Be concise. Do not invent facts."
     )
+
+    if hermes_busy():
+        return _heuristic_triage(envelopes, reason=_fallback_reason())
 
     try:
         reply = await ask_hermes(
@@ -259,37 +309,7 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
         logger.warning("Hermes triage failed, using heuristic: %s", exc)
         if _triage_cache is not None and _triage_cache[1].source == "hermes":
             return _triage_cache[1]
-        items = []
-        for env in envelopes:
-            subject = (env.get("subject") or "").lower()
-            sender = (env.get("from") or "").lower()
-            noise_hints = (
-                "unsubscribe",
-                "newsletter",
-                "noreply",
-                "no-reply",
-                "digest",
-                "invoice",
-                "receipt",
-                "onboarding",
-            )
-            is_noise = any(h in subject or h in sender for h in noise_hints)
-            items.append(
-                EmailTriageItem(
-                    id=env["id"],
-                    account=env["account"],
-                    subject=env["subject"],
-                    sender=env["from"],
-                    date=env["date"],
-                    priority="noise" if is_noise else "medium",
-                    disposition="noise" if is_noise else "reference",
-                    reason="Hermes busy — heuristic triage only",
-                    needs_reply=False,
-                    draft_reply=None,
-                    snippet=env.get("snippet") or "",
-                )
-            )
-        return EmailTriageResponse(items=items, source="fallback")
+        return _heuristic_triage(envelopes, reason=_fallback_reason(exc))
 
 
 async def send_reply(account: str, message_id: str, body: str) -> dict[str, Any]:

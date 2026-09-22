@@ -30,6 +30,22 @@ While the API is running, a background loop:
 
 After 17:00 the loop will generate a next-day briefing if none is cached, then idle.
 
+### Gladys OmniFocus runner
+
+Tag an OmniFocus task `🤖 Gladys` (the name is the instruction; the note is context) and leave it. Every 15 minutes the dashboard picks **one** eligible task, sends it to Hermes as background work, and writes the receipt back onto that same task.
+
+Eligibility:
+
+- planned time in the past or exactly now: eligible
+- planned time later: waits
+- no planned date: eligible now
+
+Lifecycle tags (created on first run if missing): `🤖 Gladys`, `gladys-running`, `gladys-done`, `gladys-blocked`, `gladys-failed`. Done tasks are completed. A receipt note is written under `📁 511 🔍 Reviews/Gladys`, and OmniFocus gets a `Review: …` action tagged only `🔎 Review` (so inherited project tags like `(Waiting)` don’t hide it from On Deck), deferred to now, with an Advanced URI to that note. Blocked tasks are flagged so they show up in review. Failed tasks stay incomplete.
+
+This is for agentic work you can leave running — the same class of job as GladysBot on Telegram, not a replacement for Ask Hermes. One Hermes run at a time: if Ask Hermes or a briefing is in flight, the runner skips that cycle. Gladys can schedule follow-up or recurring work with Hermes's `cronjob` tool (results deliver to Telegram).
+
+Disable with `OMNIFOCUS_AGENT_ENABLED=false`.
+
 ## Architecture
 
 ```
@@ -45,7 +61,7 @@ Browser  ──►  FastAPI (:8787)  ──►  Hermes OpenAI-compatible API
 
 - **Backend:** Python 3.11+, FastAPI, SQLAlchemy + asyncpg
 - **Frontend:** React 19, Vite 8, TanStack Query; markdown via `react-markdown`
-- **Live updates:** `/api/events` SSE heartbeats refresh calendar about every two minutes and push a new briefing when one is generated. OmniFocus is **not** polled on a timer (OmniJS automation contends with Hermes).
+- **Live updates:** `/api/events` SSE heartbeats refresh calendar about every two minutes and push a new briefing when one is generated. On Deck is **not** polled on a timer (OmniJS automation contends with Hermes). A separate loop checks the Gladys OmniFocus tag every 15 minutes.
 
 Production serving: if `frontend/dist` exists, FastAPI mounts `/assets` and falls back to `index.html` for the SPA.
 
@@ -154,11 +170,18 @@ Loaded from the repo-root `.env` via pydantic-settings. The dashboard binds **lo
 | `HERMES_API_KEY` / `HERMES_MODEL` | Gateway auth and model name |
 | `OBSIDIAN_MCP_URL` / `OBSIDIAN_MCP_TOKEN` | Streamable HTTP MCP |
 | `OBSIDIAN_DAILY_FOLDER` | Vault-relative daily-note directory |
+| `OBSIDIAN_VAULT_NAME` | Vault name for Advanced URI links (default `My Vault`) |
+| `OBSIDIAN_AGENT_RECEIPT_FOLDER` | Where Gladys writes success receipts |
 | `OBSIDIAN_DAILY_FORMAT` | Filename pattern (e.g. `D-YYYY-MM-DD`) |
 | `OBSIDIAN_TEMPLATE_PATH` | Vault-relative Daily Template |
 | `OMNIFOCUS_MCP_COMMAND` | OmniFocus MCP executable |
 | `OMNIFOCUS_ON_DECK_PERSPECTIVE` | Perspective name for the task list |
 | `OMNIFOCUS_TOMORROW_PERSPECTIVE` | Used when building a next-day briefing |
+| `OMNIFOCUS_AGENT_ENABLED` | Background Gladys runner (default true) |
+| `OMNIFOCUS_AGENT_TAG` | Assignment tag (default `🤖 Gladys`) |
+| `OMNIFOCUS_AGENT_POLL_SECONDS` | Pickup interval (default `900`) |
+| `OMNIFOCUS_AGENT_TIMEOUT_SECONDS` | Gladys Hermes wait; `0` means no client deadline |
+| `OMNIFOCUS_REVIEW_TAG` | Tag on the follow-up review action (default `🔎 Review`) |
 | `FANTASTICAL_MCP_COMMAND` | Fantastical MCP helper binary |
 | `PUSHOVER_USER_KEY` / `PUSHOVER_API_KEY` | Optional briefing notifications |
 | `BRIEFING_NOTE_PATH` | Optional markdown file written on each published briefing |
@@ -172,7 +195,7 @@ Routers are mounted under `/api`:
 
 - `GET /api/health`
 - `GET /api/calendar/today` and `GET /api/calendar?from=&to=`
-- `GET /api/tasks/on-deck`, `GET /api/tasks/status`, `POST /api/tasks`, `POST /api/tasks/{id}/complete`, `POST /api/tasks/{id}/incomplete`
+- `GET /api/tasks/on-deck`, `GET /api/tasks/status`, `GET /api/tasks/agent`, `POST /api/tasks`, `POST /api/tasks/{id}/complete`, `POST /api/tasks/{id}/incomplete`
 - `GET|PATCH /api/note/today`
 - `GET|POST /api/briefing` (`?force=true` regenerates)
 - `POST /api/agent/ask`

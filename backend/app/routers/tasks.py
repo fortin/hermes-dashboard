@@ -26,6 +26,16 @@ async def on_deck(force: bool = Query(False)) -> list[TaskItem]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.get("/agent")
+async def agent_queue() -> dict:
+    from ..services import omnifocus_agent
+
+    try:
+        return await omnifocus_agent.peek_queue()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @router.get("/status", response_model=StatusCounts)
 async def status(force: bool = Query(False)) -> StatusCounts:
     try:

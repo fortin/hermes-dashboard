@@ -19,6 +19,7 @@ class TaskItem(BaseModel):
     completed: bool = False
     flagged: bool = False
     project: str | None = None
+    project_id: str | None = None
     due: str | None = None
     defer: str | None = None
     planned: str | None = None

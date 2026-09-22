@@ -164,6 +164,10 @@ async def _write_path(path: str, content: str) -> None:
     await client.call_tool("vault_write", {"path": path, "content": content})
 
 
+async def write_vault_note(path: str, content: str) -> None:
+    await _write_path(path, content)
+
+
 async def get_today_note(create: bool = True) -> DailyNote:
     settings = get_settings()
     day = datetime.now(TZ).date()
