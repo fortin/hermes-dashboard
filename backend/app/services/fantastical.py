@@ -13,7 +13,9 @@ from ..models.schemas import CalendarEvent
 TZ = ZoneInfo("Asia/Bangkok")
 _CAL_LOCK = asyncio.Lock()
 _TODAY_TTL_S = 60.0
+_CALENDARS_TTL_S = 10 * 60.0
 _today_cache: tuple[float, list[CalendarEvent]] | None = None
+_calendars_cache: tuple[float, dict[str, str]] | None = None
 
 
 def _local(dt: datetime) -> datetime:
@@ -61,7 +63,40 @@ def _as_list(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _normalize_event(raw: dict[str, Any]) -> CalendarEvent | None:
+def _calendar_id_from_raw(raw: dict[str, Any], event_id: str) -> str:
+    cal_id = raw.get("calendarId") or raw.get("calendar_id") or ""
+    if cal_id:
+        return str(cal_id)
+    if ";" in event_id:
+        return event_id.split(";", 1)[0]
+    return ""
+
+
+def _calendar_title(
+    raw: dict[str, Any],
+    event_id: str,
+    calendars: dict[str, str] | None,
+) -> str:
+    calendar = (
+        raw.get("calendar")
+        or raw.get("calendarName")
+        or raw.get("calendar_name")
+        or ""
+    )
+    if isinstance(calendar, dict):
+        calendar = calendar.get("title") or calendar.get("name") or ""
+    if calendar:
+        return str(calendar)
+    cal_id = _calendar_id_from_raw(raw, event_id)
+    if cal_id and calendars:
+        return calendars.get(cal_id, "")
+    return ""
+
+
+def _normalize_event(
+    raw: dict[str, Any],
+    calendars: dict[str, str] | None = None,
+) -> CalendarEvent | None:
     title = (
         raw.get("title")
         or raw.get("summary")
@@ -83,14 +118,7 @@ def _normalize_event(raw: dict[str, Any]) -> CalendarEvent | None:
         or raw.get("uid")
         or f"{title}-{start}"
     )
-    calendar = (
-        raw.get("calendar")
-        or raw.get("calendarName")
-        or raw.get("calendar_name")
-        or ""
-    )
-    if isinstance(calendar, dict):
-        calendar = calendar.get("title") or calendar.get("name") or ""
+    calendar = _calendar_title(raw, event_id, calendars)
     all_day = bool(
         raw.get("allDay")
         or raw.get("all_day")
@@ -137,7 +165,19 @@ async def _client(settings: Settings):
     )
 
 
-def _events_from_raw(raw: Any) -> list[CalendarEvent]:
+def _titles_from_calendars(raw: Any) -> dict[str, str]:
+    titles: dict[str, str] = {}
+    for item in _as_list(raw):
+        cal_id = str(item.get("id") or "")
+        title = item.get("title") or item.get("name") or ""
+        if cal_id and title:
+            titles[cal_id] = str(title)
+    return titles
+
+
+def _events_from_raw(
+    raw: Any, calendars: dict[str, str] | None = None
+) -> list[CalendarEvent]:
     events: list[CalendarEvent] = []
     for item in _as_list(raw):
         # Fantastical may mix events and reminders; prefer event-like rows
@@ -146,19 +186,33 @@ def _events_from_raw(raw: Any) -> list[CalendarEvent]:
             item.get("start") or item.get("startDate")
         ):
             continue
-        normalised = _normalize_event(item)
+        normalised = _normalize_event(item, calendars)
         if normalised:
             events.append(normalised)
     events.sort(key=lambda e: e.start)
     return events
 
 
+async def _calendar_titles(client) -> dict[str, str]:
+    global _calendars_cache
+    if _calendars_cache is not None:
+        cached_at, cached = _calendars_cache
+        if time.monotonic() - cached_at < _CALENDARS_TTL_S and cached:
+            return cached
+    raw = await client.call_tool("queryCalendars", {})
+    titles = _titles_from_calendars(raw)
+    if titles:
+        _calendars_cache = (time.monotonic(), titles)
+    return titles
+
+
 async def _query_when(when: str) -> list[CalendarEvent]:
     settings = get_settings()
     async with _CAL_LOCK:
         client = await _client(settings)
+        calendars = await _calendar_titles(client)
         raw = await client.call_tool("queryCalendarItems", {"when": when})
-    return _events_from_raw(raw)
+    return _events_from_raw(raw, calendars)
 
 
 async def get_events(
