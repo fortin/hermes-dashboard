@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 from ..config import Settings, get_settings
 from ..mcp.client import registry
@@ -206,13 +209,89 @@ async def _calendar_titles(client) -> dict[str, str]:
     return titles
 
 
-async def _query_when(when: str) -> list[CalendarEvent]:
+def _payload_summary(raw: Any) -> str:
+    if isinstance(raw, dict):
+        keys = ",".join(sorted(str(key) for key in raw.keys())[:8])
+        return f"dict keys={keys}"
+    if isinstance(raw, list):
+        return f"list len={len(raw)}"
+    if isinstance(raw, str):
+        return f"str {raw[:120]!r}"
+    if raw is None:
+        return "none"
+    return type(raw).__name__
+
+
+async def _reset_session() -> None:
+    """Drop the Fantastical MCP process after the XPC connection dies."""
+    global _calendars_cache
+    _calendars_cache = None
+    await registry.drop("fantastical")
+
+
+async def _query_locked(when: str) -> list[CalendarEvent]:
     settings = get_settings()
+    client = await _client(settings)
+    calendars = await _calendar_titles(client)
+    raw = await client.call_tool("queryCalendarItems", {"when": when})
+    events = _events_from_raw(raw, calendars)
+    if not events:
+        logger.warning(
+            "Fantastical query %r parsed 0 events (%s)",
+            when,
+            _payload_summary(raw),
+        )
+    return events
+
+
+async def _query_resilient(when: str) -> list[CalendarEvent]:
+    """Retry a query that came back empty or lost the Fantastical connection.
+
+    A dead XPC session often returns no items instead of raising. The next
+    call, after the session is replaced, returns the real events. A day that
+    is actually empty stays empty: the second call is on the same session and
+    does not reconnect unless that call itself fails.
+    """
     async with _CAL_LOCK:
-        client = await _client(settings)
-        calendars = await _calendar_titles(client)
-        raw = await client.call_tool("queryCalendarItems", {"when": when})
-    return _events_from_raw(raw, calendars)
+        try:
+            events = await _query_locked(when)
+        except Exception:
+            logger.warning(
+                "Fantastical query %r failed; resetting session",
+                when,
+                exc_info=True,
+            )
+            await _reset_session()
+            return await _query_locked(when)
+        if events:
+            return events
+        logger.warning("Fantastical query %r returned no events; retrying once", when)
+        try:
+            retried = await _query_locked(when)
+        except Exception:
+            logger.warning(
+                "Fantastical retry %r failed; resetting session",
+                when,
+                exc_info=True,
+            )
+            await _reset_session()
+            retried = await _query_locked(when)
+        if retried:
+            logger.warning(
+                "Fantastical retry recovered %s events for %r",
+                len(retried),
+                when,
+            )
+        return retried
+
+
+async def _query_when(when: str) -> list[CalendarEvent]:
+    return await _query_resilient(when)
+
+
+def _local_day_bounds(day: datetime) -> tuple[datetime, datetime]:
+    start = _local(day).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
 
 
 async def get_events(
@@ -228,13 +307,17 @@ async def get_today() -> list[CalendarEvent]:
         cached_at, cached = _today_cache
         if time.monotonic() - cached_at < _TODAY_TTL_S:
             return cached
-    events = await _query_when("today")
+    start, end = _local_day_bounds(datetime.now(TZ))
+    # Fantastical wants a concrete date. The word "today" comes back empty
+    # when the XPC session has just dropped, even though the day has events.
+    events = await _query_when(_parse_when(start, end))
     _today_cache = (time.monotonic(), events)
     return events
 
 
 async def get_tomorrow() -> list[CalendarEvent]:
-    return await _query_when("tomorrow")
+    start, end = _local_day_bounds(datetime.now(TZ) + timedelta(days=1))
+    return await _query_when(_parse_when(start, end))
 
 
 async def get_upcoming(days: int = 7) -> list[CalendarEvent]:

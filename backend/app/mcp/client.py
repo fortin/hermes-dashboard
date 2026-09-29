@@ -49,24 +49,60 @@ def is_cancel_scope_noise(exc: BaseException, _seen: set[int] | None = None) -> 
     return False
 
 
-def _normalize_tool_result(result: Any) -> Any:
-    if getattr(result, "isError", False):
-        parts = []
-        for block in getattr(result, "content", []) or []:
-            text = getattr(block, "text", None)
-            if text:
-                parts.append(text)
-        raise RuntimeError("; ".join(parts) or f"MCP tool error: {result}")
+_CONNECTION_FAILURES = (
+    "lost the connection",
+    "waiting for authorization",
+    "failed to connect",
+    "not connected",
+    "invalid response",
+    "timed out",
+    "xpc connection",
+)
 
-    structured = getattr(result, "structuredContent", None)
-    if structured is not None:
-        return structured
 
+def _content_texts(result: Any) -> list[str]:
     texts: list[str] = []
     for block in getattr(result, "content", []) or []:
         text = getattr(block, "text", None)
         if text:
             texts.append(text)
+    return texts
+
+
+def _connection_failure(texts: list[str]) -> str | None:
+    blob = " ".join(texts).strip()
+    if not blob:
+        return None
+    lowered = blob.lower()
+    if any(snippet in lowered for snippet in _CONNECTION_FAILURES):
+        return blob[:300]
+    return None
+
+
+def _structured_has_items(structured: Any) -> bool:
+    if isinstance(structured, list):
+        return len(structured) > 0
+    if not isinstance(structured, dict):
+        return False
+    for key in ("items", "events", "results", "calendarItems", "data"):
+        val = structured.get(key)
+        if isinstance(val, list) and val:
+            return True
+    return False
+
+
+def _normalize_tool_result(result: Any) -> Any:
+    texts = _content_texts(result)
+    if getattr(result, "isError", False):
+        raise RuntimeError("; ".join(texts) or f"MCP tool error: {result}")
+    failure = _connection_failure(texts)
+    structured = getattr(result, "structuredContent", None)
+    if failure and not _structured_has_items(structured):
+        raise RuntimeError(failure)
+
+    if structured is not None:
+        return structured
+
     if not texts:
         return None
     if len(texts) == 1:
@@ -141,16 +177,22 @@ class McpRegistry:
             logger.info("MCP HTTP session ready: %s", name)
             return handle
 
+    async def drop(self, name: str) -> None:
+        """Close one session so the next call opens a fresh process."""
+        handle = self._servers.pop(name, None)
+        if handle is None:
+            return
+        try:
+            await handle.close()
+        except BaseException as exc:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            if not is_cancel_scope_noise(exc):
+                logger.exception("Error closing MCP server %s", name)
+
     async def close_all(self) -> None:
-        for name, handle in list(self._servers.items()):
-            try:
-                await handle.close()
-            except BaseException as exc:
-                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                if not is_cancel_scope_noise(exc):
-                    logger.exception("Error closing MCP server %s", name)
-            self._servers.pop(name, None)
+        for name in list(self._servers):
+            await self.drop(name)
 
 
 registry = McpRegistry()
