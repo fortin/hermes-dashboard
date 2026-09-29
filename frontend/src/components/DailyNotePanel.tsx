@@ -5,7 +5,7 @@ import { MarkdownView } from './MarkdownView'
 
 export function DailyNotePanel() {
   const qc = useQueryClient()
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, isFetching, refetch } = useQuery({
     queryKey: ['note'],
     queryFn: api.todayNote,
     refetchOnWindowFocus: false,
@@ -126,14 +126,37 @@ export function DailyNotePanel() {
     }
   }, [])
 
+  function applyNote(note: DailyNote) {
+    contentRef.current = note.content
+    revisionRef.current = note.revision
+    baselineRef.current = note.content
+    setContent(note.content)
+    setRevision(note.revision)
+    setBaseline(note.content)
+    seeded.current = true
+  }
+
   async function reloadFromVault() {
     if (timerRef.current) window.clearTimeout(timerRef.current)
     pendingRef.current = false
-    seeded.current = false
     setSaveState('idle')
     setMessage(null)
     setEditing(false)
-    await qc.invalidateQueries({ queryKey: ['note'] })
+    const result = await refetch()
+    if (!result.isSuccess || !result.data) return
+    applyNote(result.data)
+    if (result.data.created) {
+      setMessage('Created today’s note from your Daily Template.')
+    }
+  }
+
+  async function refreshNote() {
+    if (savingRef.current) return
+    if (contentRef.current !== baselineRef.current) {
+      const discard = window.confirm('Discard unsaved changes and reload the daily note?')
+      if (!discard) return
+    }
+    await reloadFromVault()
   }
 
   async function toggleEditing() {
@@ -169,6 +192,14 @@ export function DailyNotePanel() {
             {saveState === 'conflict' && 'Conflict'}
             {saveState === 'error' && 'Save failed'}
           </span>
+          <button
+            type="button"
+            className="text-btn"
+            onClick={() => void refreshNote()}
+            disabled={isLoading || isFetching || saveState === 'saving' || !data}
+          >
+            {isFetching && !isLoading ? 'Refreshing…' : 'Refresh'}
+          </button>
           <button
             type="button"
             className="text-btn"
