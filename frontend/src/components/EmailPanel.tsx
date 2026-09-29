@@ -202,6 +202,7 @@ export function EmailPanel() {
       {data?.generated_at && (
         <p className="muted tiny">
           {data.source === 'fallback' ? 'Heuristic · ' : ''}
+          {data.source === 'apple' ? 'Apple Intelligence · ' : ''}
           {new Date(data.generated_at).toLocaleTimeString()}
         </p>
       )}

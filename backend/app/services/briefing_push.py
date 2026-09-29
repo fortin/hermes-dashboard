@@ -11,7 +11,7 @@ from typing import Any
 from ..config import get_settings
 from ..models.schemas import Briefing
 from . import pushover
-from .hermes import is_failed_model_reply, local_now_context
+from .hermes import MODEL_BRIEFING_SOURCES, is_failed_model_reply, local_now_context
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +24,15 @@ _SAME_JACCARD = 0.88
 
 _lock = asyncio.Lock()
 _last_pushed_fp: str | None = None
+_last_pushed_context_fp: str | None = None
 _fingerprint_path_override: Path | None = None
+_context_fingerprint_path_override: Path | None = None
 
 
 def reset_state() -> None:
-    global _last_pushed_fp
+    global _last_pushed_fp, _last_pushed_context_fp
     _last_pushed_fp = None
+    _last_pushed_context_fp = None
 
 
 def is_configured() -> bool:
@@ -90,8 +93,17 @@ def _fingerprint_path() -> Path:
     )
 
 
-def _remember_pushed(summary: str) -> None:
-    global _last_pushed_fp
+def _context_fingerprint_path() -> Path:
+    if _context_fingerprint_path_override is not None:
+        return _context_fingerprint_path_override
+    return (
+        Path.home()
+        / "Library/Application Support/hermes-dashboard/last-pushed-context.txt"
+    )
+
+
+def _remember_pushed(summary: str, context_fp: str = "") -> None:
+    global _last_pushed_fp, _last_pushed_context_fp
     text = fingerprint(summary)
     _last_pushed_fp = text
     path = _fingerprint_path()
@@ -102,6 +114,18 @@ def _remember_pushed(summary: str) -> None:
         tmp.replace(path)
     except OSError:
         logger.exception("Failed to persist last pushed briefing fingerprint")
+    context_fp = (context_fp or "").strip()
+    _last_pushed_context_fp = context_fp
+    if not context_fp:
+        return
+    ctx_path = _context_fingerprint_path()
+    try:
+        ctx_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ctx_path.with_name(ctx_path.name + ".tmp")
+        tmp.write_text(context_fp + "\n", encoding="utf-8")
+        tmp.replace(ctx_path)
+    except OSError:
+        logger.exception("Failed to persist last pushed briefing context fingerprint")
 
 
 def _previous_pushed() -> str | None:
@@ -113,6 +137,19 @@ def _previous_pushed() -> str | None:
     except OSError:
         _last_pushed_fp = ""
     return _last_pushed_fp or None
+
+
+def _previous_context_fp() -> str | None:
+    global _last_pushed_context_fp
+    if _last_pushed_context_fp is not None:
+        return _last_pushed_context_fp or None
+    try:
+        _last_pushed_context_fp = (
+            _context_fingerprint_path().read_text(encoding="utf-8").strip()
+        )
+    except OSError:
+        _last_pushed_context_fp = ""
+    return _last_pushed_context_fp or None
 
 
 def _unix(iso: str) -> int | None:
@@ -136,7 +173,7 @@ async def publish_briefing(
     *,
     now: dict[str, Any] | None = None,
 ) -> bool:
-    if briefing.source != "hermes":
+    if briefing.source not in MODEL_BRIEFING_SOURCES:
         return False
     summary = (briefing.summary or "").strip()
     if is_failed_model_reply(summary):
@@ -144,6 +181,7 @@ async def publish_briefing(
         return False
     now = now or local_now_context()
     settings = get_settings()
+    context_fp = (briefing.context_fingerprint or "").strip()
 
     async with _lock:
         note_path = (settings.briefing_note_path or "").strip()
@@ -155,9 +193,17 @@ async def publish_briefing(
 
         if not is_configured():
             return bool(note_path)
+        previous_ctx = _previous_context_fp()
         previous = _previous_pushed()
-        if previous is not None and substantively_same(previous, summary):
+        if context_fp and previous_ctx:
+            if context_fp == previous_ctx:
+                logger.info("Skipping briefing push; Fantastical/OmniFocus unchanged")
+                return True
+            # Source changed — notify even when Apple rephrases almost the same way.
+        elif previous is not None and substantively_same(previous, summary):
             logger.info("Skipping briefing push; no substantive change")
+            if context_fp:
+                _remember_pushed(summary, context_fp)
             return True
         title = f"Hermes Briefing · {now.get('weekday', '')} {now.get('time_of_day', '')}".strip()
         sent = await pushover.send_message(
@@ -166,38 +212,49 @@ async def publish_briefing(
             timestamp=_unix(briefing.generated_at),
         )
         if sent:
-            _remember_pushed(summary)
+            _remember_pushed(summary, context_fp)
         return sent
 
 
-async def _briefing_context() -> dict[str, Any]:
+async def briefing_context() -> dict[str, Any]:
+    """Calendar and On Deck snapshot for a briefing.
+
+    A failed calendar read is flagged instead of being passed on as an empty
+    day. Callers must not ask Hermes to brief that snapshot.
+    """
     from . import fantastical, omnifocus
 
     now = local_now_context()
     try:
-        return {
-            "calendar": [e.model_dump() for e in await fantastical.get_today()],
-            "tasks": [t.model_dump() for t in await omnifocus.get_on_deck()],
-            "now": now,
-        }
+        calendar = [e.model_dump() for e in await fantastical.get_today()]
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Briefing snapshot incomplete: %s", exc)
-        return {"error": str(exc), "now": now}
+        logger.warning("Briefing calendar unavailable: %s", exc)
+        return {"calendar_unavailable": True, "error": str(exc), "now": now}
+    try:
+        tasks = [t.model_dump() for t in await omnifocus.get_on_deck()]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Briefing tasks unavailable: %s", exc)
+        tasks = []
+    logger.info("Briefing snapshot: %s calendar events", len(calendar))
+    return {"calendar": calendar, "tasks": tasks, "now": now}
 
 
 async def push_due_briefing() -> None:
     now = local_now_context()
     from .hermes import generate_briefing, peek_briefing
 
+    held = peek_briefing()
+    if held is not None and held.horizon == "tomorrow":
+        return
     hour = int(now.get("hour") or 0)
     if hour >= 17:
         if peek_briefing() is not None:
             return
-        await generate_briefing(await _briefing_context(), force=False)
+        await generate_briefing(await briefing_context(), force=False)
         return
     if slot_for(now) is None:
         return
-    await generate_briefing(await _briefing_context(), force=False)
+    await generate_briefing(await briefing_context(), force=False)
 
 
 async def run_loop() -> None:

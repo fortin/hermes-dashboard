@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
+import shutil
+import signal
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,7 +17,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from ..config import get_settings
-from ..models.schemas import AgentReply, Briefing
+from ..models.schemas import AgentReply, Briefing, markdown_paragraphs, strip_leading_date
 
 logger = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Bangkok")
@@ -21,6 +25,7 @@ TZ = ZoneInfo("Asia/Bangkok")
 # Share one Hermes run at a time from this dashboard process so we don't
 # exhaust gateway.max_concurrent_runs alongside other Hermes clients.
 _hermes_lock = asyncio.Lock()
+_apple_lock = asyncio.Lock()
 _briefing_lock = asyncio.Lock()
 _BRIEFING_TTL_S = 5 * 60
 _briefing_cache: tuple[float, Briefing] | None = None
@@ -33,6 +38,12 @@ _hydrated_nextday = False
 _nextday_path_override: Path | None = None
 _DAY_DONE_HOUR = 17
 _NEXTDAY_KIND = "perspective-v2"
+_APPLE_MODEL = "apple-intelligence"
+_APPLE_TIMEOUT_S = 180.0
+# On-device Use Model shares a 4096-token window with the reply.
+# A 2549-character briefing prompt was rejected; ~2400 still answered.
+_APPLE_PROMPT_MAX = 2000
+MODEL_BRIEFING_SOURCES = frozenset({"hermes", "apple", "schedule"})
 _FAILED_REPLY_MARKERS = (
     "operation interrupted",
     "waiting for model response",
@@ -41,6 +52,7 @@ _FAILED_REPLY_MARKERS = (
     "stream stale",
     "empty stream",
     "interrupted during api call",
+    "api call failed",
 )
 # Hermes itself also has HERMES_API_TIMEOUT (see ~/.hermes/.env). Gladys uses a
 # separate read timeout so overnight OmniFocus jobs are not cut at 30 minutes.
@@ -127,6 +139,57 @@ def _clock_from_now(now: dict[str, Any]) -> datetime:
     return datetime.now(TZ)
 
 
+def _local_on_date(
+    date: Any,
+    hhmm: Any,
+    clock: datetime,
+) -> datetime | None:
+    if not date or not hhmm or hhmm == "all day":
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(hhmm).strip())
+    if match is None:
+        return None
+    try:
+        year, month, day = (int(part) for part in str(date).split("-"))
+    except ValueError:
+        return None
+    return datetime(
+        year,
+        month,
+        day,
+        int(match.group(1)),
+        int(match.group(2)),
+        tzinfo=clock.tzinfo or TZ,
+    )
+
+
+def omit_finished_events(
+    events: list[dict[str, Any]],
+    clock: datetime,
+) -> list[dict[str, Any]]:
+    """Drop timed events that have already ended. Keep all-day and in-progress."""
+    kept: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("all_day") or event.get("start_local") == "all day":
+            kept.append(event)
+            continue
+        end = _parse_local(str(event.get("end") or "")) or _local_on_date(
+            event.get("date"), event.get("end_local"), clock
+        )
+        if end is not None:
+            if end > clock:
+                kept.append(event)
+            continue
+        start = _parse_local(str(event.get("start") or "")) or _local_on_date(
+            event.get("date"), event.get("start_local"), clock
+        )
+        if start is None or start > clock:
+            kept.append(event)
+    return kept
+
+
 def remaining_open_events(
     events: list[dict[str, Any]],
     clock: datetime,
@@ -156,6 +219,34 @@ def day_is_done(calendar: list[dict[str, Any]], now: dict[str, Any]) -> bool:
     if hour is None:
         hour = clock.hour
     return int(hour) >= _DAY_DONE_HOUR
+
+
+def _timed_events_remain(events: list[dict[str, Any]], now: dict[str, Any]) -> bool:
+    clock = _clock_from_now(now)
+    for event in omit_finished_events(events, clock):
+        if event.get("all_day") or event.get("start_local") == "all day":
+            continue
+        return True
+    return False
+
+
+def _has_named_tasks(tasks: list[Any]) -> bool:
+    return any(isinstance(task, dict) and _task_id(task) and _task_name(task) for task in tasks)
+
+
+def look_ahead_tomorrow(
+    calendar: list[dict[str, Any]],
+    tasks: list[Any],
+    now: dict[str, Any],
+) -> bool:
+    """Preview tomorrow once today's timed events and On Deck are both finished.
+
+    Evening with nothing left on the clock still looks ahead even if On Deck
+    has tasks, matching the previous Hermes horizon.
+    """
+    if day_is_done(calendar, now):
+        return True
+    return not _timed_events_remain(calendar, now) and not _has_named_tasks(tasks)
 
 
 _IGNORED_HOLIDAY_CALENDARS = frozenset(
@@ -385,7 +476,10 @@ async def ask_hermes(
                             max_attempts,
                             last_error,
                         )
-                        wait = min(2 ** attempt, 20)
+                        # The gateway already retried. Repeating a compute
+                        # error here just pins the shared lock and wedges
+                        # the local model.
+                        break
                     else:
                         return AgentReply(
                             reply=text,
@@ -396,6 +490,477 @@ async def ask_hermes(
             await asyncio.sleep(wait)
 
     raise HermesUnavailable(last_error, retryable=True)
+
+
+def siri_binary() -> Path:
+    configured = (get_settings().siri_bin or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    found = shutil.which("siri")
+    if found:
+        return Path(found)
+    return Path.home() / ".local" / "bin" / "siri"
+
+
+def _kill_apple_process(proc: asyncio.subprocess.Process) -> None:
+    """Stop siri and the Shortcuts child. Killing the shell alone leaves the request open."""
+    if proc.returncode is not None or proc.pid is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        proc.kill()
+
+
+async def ask_apple(message: str, *, timeout: float = _APPLE_TIMEOUT_S) -> AgentReply:
+    """One-shot Apple Intelligence reply via `siri --raw`. No tools."""
+    async with _apple_lock:
+        return await _ask_apple_unlocked(message, timeout=timeout)
+
+
+async def _ask_apple_unlocked(message: str, *, timeout: float) -> AgentReply:
+    prompt = (message or "").strip()
+    if not prompt:
+        raise HermesUnavailable("Apple Intelligence prompt was empty")
+    binary = siri_binary()
+    env = os.environ.copy()
+    env["SIRI_RENDER"] = "0"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(binary),
+            "--shortcut",
+            get_settings().siri_shortcut,
+            "--raw",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise HermesUnavailable(f"siri CLI not found at {binary}") from exc
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(prompt.encode("utf-8")),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        _kill_apple_process(proc)
+        await proc.wait()
+        raise HermesUnavailable(
+            f"Apple Intelligence timed out after {timeout:.0f}s"
+        ) from exc
+    text = stdout.decode("utf-8", errors="replace").strip()
+    err = stderr.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0 or not text:
+        detail = err or text or f"exit {proc.returncode}"
+        raise HermesUnavailable(f"Apple Intelligence failed: {detail[:500]}")
+    if is_failed_model_reply(text):
+        raise HermesUnavailable(text[:400] or "empty Apple Intelligence reply")
+    return AgentReply(reply=text, model=_APPLE_MODEL)
+
+
+_VAGUE_TASK_REF = re.compile(
+    r"\b(?:"
+    r"this task|that task|these (?:materials|tasks)|the task|"
+    r"tackling it|completing (?:this|it)|revising these|"
+    r"consider a couple|a couple of shorter tasks|"
+    r"this will\b|that will\b|"
+    r"although it(?:'s| is) slightly deferred"
+    r")\b",
+    re.IGNORECASE,
+)
+_INVENTORY_LABEL = re.compile(
+    r"(?m)^(?:[-*]\s*)?.{2,90}\(\d{1,2}:\d{2}(?:\s*[-–]\s*\d{1,2}:\d{2})?\):\s*",
+)
+_CAL_INVENTORY = re.compile(
+    r"should be (?:taken|attended|done|completed) as (?:planned|scheduled)",
+    re.IGNORECASE,
+)
+_MAX_NAMED_TASKS = 3
+
+
+def _sentences(text: str):
+    for line in (text or "").splitlines():
+        for part in re.split(r"(?<=[.!?])\s+", line.strip()):
+            if part:
+                yield part
+
+
+_DANGLING_OPENER = re.compile(
+    r"^(?:it(?:'s|’s| is)?|this|that)\b",
+    re.IGNORECASE,
+)
+_NAME_TOKEN = re.compile(r"[A-Za-z0-9]{4,}")
+_NAME_STOP = frozenset(
+    {
+        "this",
+        "that",
+        "with",
+        "from",
+        "your",
+        "have",
+        "been",
+        "will",
+        "before",
+        "after",
+        "about",
+        "into",
+        "over",
+        "then",
+        "when",
+        "what",
+        "they",
+        "them",
+        "should",
+        "would",
+        "could",
+        "task",
+        "tasks",
+        "work",
+        "time",
+        "more",
+        "than",
+    }
+)
+
+
+def _task_match_tokens(name: str) -> set[str]:
+    return {
+        token
+        for token in _NAME_TOKEN.findall(name.casefold())
+        if token not in _NAME_STOP
+    }
+
+
+def _pick_dangling_name(
+    sentence: str,
+    preferred: list[str],
+    pool: list[str],
+    used: set[str],
+) -> str | None:
+    available = [name for name in pool if name not in used]
+    folded = sentence.casefold()
+
+    def score(name: str) -> int:
+        return sum(1 for token in _task_match_tokens(name) if token in folded)
+
+    best = max((score(name) for name in available), default=0)
+    if not best:
+        # No lexical overlap — don't glue a random On Deck name onto an
+        # invented referent ("before the embassy closes").
+        return None
+    tied = [name for name in available if score(name) == best]
+    for name in preferred:
+        if name in tied:
+            return name
+    return tied[0]
+
+def name_dangling_opener(
+    summary: str,
+    task_names: list[str],
+    *,
+    all_names: list[str] | None = None,
+) -> str:
+    """Name or drop opening sentences that never say which task they mean."""
+    preferred = [name.strip() for name in task_names if name and name.strip()]
+    pool = [
+        name.strip()
+        for name in (all_names if all_names is not None else preferred)
+        if name and name.strip()
+    ]
+    for name in preferred:
+        if name not in pool:
+            pool.append(name)
+    used: set[str] = set()
+    still_opening = True
+    paragraphs: list[str] = []
+    for paragraph in (summary or "").split("\n\n"):
+        parts: list[str] = []
+        for part in _sentences(paragraph):
+            dangling = bool(
+                still_opening
+                and _DANGLING_OPENER.search(part)
+                and not _mentions_listed_task(part, pool)
+            )
+            if dangling:
+                name = _pick_dangling_name(part, preferred, pool, used) if pool else None
+                if name:
+                    used.add(name)
+                    parts.append(f"**{name}.** {part}")
+                    continue
+                # Invented referent ("before the embassy closes") with no listed
+                # name to attach — drop the sentence rather than leave "it".
+                continue
+            still_opening = False
+            if _mentions_listed_task(part, pool):
+                for name in pool:
+                    if name.casefold() in part.casefold():
+                        used.add(name)
+            parts.append(part)
+        if parts:
+            paragraphs.append(" ".join(parts))
+    return "\n\n".join(paragraphs)
+
+
+def _repair_cached_opener(briefing: Briefing, tasks: list[Any]) -> Briefing:
+    global _briefing_cache, _nextday_cache
+    by_id: dict[str, str] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = _task_id(task)
+        task_name = _task_name(task)
+        if task_id and task_name:
+            by_id[task_id] = task_name
+    # Also harvest bold names already in the summary so nextday repairs work
+    # without a fresh OmniFocus fetch of tomorrow's perspective.
+    bold = re.findall(r"\*\*(.+?)\*\*", briefing.summary or "")
+    ordered = [by_id[tid] for tid in briefing.suggested_task_ids if tid in by_id]
+    all_names = list(dict.fromkeys([*ordered, *by_id.values(), *bold]))
+    repaired = name_dangling_opener(
+        briefing.summary, ordered or bold[:1], all_names=all_names
+    )
+    if repaired == briefing.summary:
+        return briefing
+    updated = briefing.model_copy(update={"summary": repaired})
+    if _briefing_cache is not None and _briefing_cache[1] is briefing:
+        _briefing_cache = (_briefing_cache[0], updated)
+    if briefing.horizon == "tomorrow":
+        if _nextday_cache is not None and _nextday_cache[1] is briefing:
+            _nextday_cache = (_nextday_cache[0], updated)
+        _save_nextday(
+            (_nextday_cache[0] if _nextday_cache else str(local_now_context().get("date") or "")),
+            updated,
+        )
+    else:
+        _save_last_good(updated)
+    return updated
+
+
+def _apple_unusable_reason(
+    text: str,
+    task_names: list[str] | None = None,
+    task_ids: list[str] | None = None,
+) -> str | None:
+    """Why an Apple briefing cannot be shown, or None when it can."""
+    body = text or ""
+    lowered = body.lower()
+    if lowered.count('{"summary"') >= 3:
+        return "looped JSON"
+    if any(
+        phrase in lowered
+        for phrase in (
+            "json only",
+            "instructions are not tasks",
+            "do not invent holidays",
+            "use only listed events",
+        )
+    ):
+        return "echoed instructions"
+    if len(_INVENTORY_LABEL.findall(body)) >= 3:
+        return "inventory labels"
+    if len(_CAL_INVENTORY.findall(body)) >= 2:
+        return "calendar catalogue"
+    names = [name for name in (task_names or []) if name.strip()]
+    if names and _VAGUE_TASK_REF.search(body) and not _mentions_listed_task(body, names):
+        return "vague task reference with no listed name"
+    if names:
+        mentioned = sum(1 for name in names if name.casefold() in body.casefold())
+        if mentioned > _MAX_NAMED_TASKS:
+            return f"named {mentioned} tasks"
+    for task_id in task_ids or []:
+        if task_id and len(task_id) >= 8 and task_id in body:
+            return "raw task id in prose"
+    return None
+
+
+def apple_briefing_unusable(
+    text: str,
+    task_names: list[str] | None = None,
+    task_ids: list[str] | None = None,
+) -> bool:
+    """True when the on-device model echoed instructions, hedged names, or inventoried."""
+    return _apple_unusable_reason(text, task_names, task_ids) is not None
+
+
+def apple_briefing_prompt(
+    now: dict[str, Any],
+    events: list[dict[str, Any]],
+    task_rows: list[dict[str, str]],
+    *,
+    tomorrow: dict[str, str] | None = None,
+) -> str:
+    """Compact on-device briefing prompt: triage, not inventory."""
+    if tomorrow is not None:
+        intro = (
+            f"Tomorrow {tomorrow['weekday']} {tomorrow['date']} look-ahead "
+            f"(now {now.get('weekday')} {now.get('time_of_day')}). "
+            "Triage — do not list every item. Write 2-4 short paragraphs "
+            "(~100-160 words). First sentence must name an event or bold a "
+            "task — never open with It/This/That. Name what you pick; bold "
+            "task names. Never put OmniFocus ids in the prose. No date opener, "
+            "no pep talk, no 'Title (time): This is...' catalogue.\n"
+            "Events:\n"
+        )
+        task_intro = (
+            f"Tasks ({get_settings().omnifocus_tomorrow_perspective}):\n"
+        )
+        cover = (
+            "Name the first timed commitment and the single best morning task "
+            "(note due/defer/planned if shown, say why it fits). Mention at most "
+            f"{_MAX_NAMED_TASKS} tasks total; leave the rest unmentioned."
+        )
+    else:
+        intro = (
+            f"{now.get('weekday')} {now.get('date')} {now.get('time_of_day')} "
+            f"({now.get('timezone')}). Triage the next few hours — do not list "
+            "every event or task. Write 2-4 short paragraphs (~100-160 words). "
+            "Name what you pick in that same sentence; bold task names. "
+            "Do not say 'this' or 'this will' unless the name is in that sentence. "
+            "Never put OmniFocus ids in the "
+            "prose. No date opener, no pep talk, no 'Title (time): This is...' "
+            "catalogue.\n"
+            "Events still ahead:\n"
+        )
+        task_intro = "On Deck tasks:\n"
+        cover = (
+            "Briefly place free blocks against timed commitments, then recommend "
+            "the highest-value On Deck task that still fits before the next "
+            "commitment (name it, note due/defer/planned, say why). Add at most "
+            f"{_MAX_NAMED_TASKS - 1} more named tasks only if they fit the same "
+            "window; leave everything else unmentioned."
+        )
+    if task_rows:
+        footer = (
+            f"{cover} Never invent events or tasks.\n"
+            'Return JSON only: {"summary":"markdown paragraphs; use \\n",'
+            '"suggested_task_ids":["id"]} with 1-3 ids from the list above.'
+        )
+        task_lines = [
+            " | ".join(
+                [str(row["name"])]
+                + [
+                    f"{key} {row[key]}"
+                    for key in ("due", "defer", "planned")
+                    if row.get(key)
+                ]
+                + [f"id {row['id']}"]
+            )
+            for row in task_rows
+        ]
+    else:
+        footer = (
+            "The task list is empty. Cover timed commitments and free blocks only "
+            "in 1-3 short paragraphs. Do not name or invent any task.\n"
+            'Return JSON only: {"summary":"markdown paragraphs; use \\n",'
+            '"suggested_task_ids":[]}'
+        )
+        task_lines = []
+    text = _fit_apple_prompt(
+        intro,
+        [_apple_event_line(event) for event in events],
+        task_intro,
+        task_lines,
+        footer,
+    )
+    if len(text) > _APPLE_PROMPT_MAX:
+        raise HermesUnavailable(
+            f"Briefing prompt is {len(text)} chars; over the on-device limit"
+        )
+    return text
+
+
+async def _ask_briefing(
+    prompt: str,
+    *,
+    apple_prompt: str,
+    max_attempts: int,
+    task_names: list[str] | None = None,
+    task_ids: list[str] | None = None,
+) -> AgentReply:
+    if get_settings().apple_intelligence:
+        try:
+            reply = await ask_apple(apple_prompt)
+            reason = _apple_unusable_reason(reply.reply, task_names, task_ids)
+            if reason:
+                logger.warning(
+                    "Apple briefing unusable (%s): %.400s", reason, reply.reply
+                )
+                raise HermesUnavailable(
+                    f"Apple Intelligence briefing was not usable ({reason})"
+                )
+            return reply
+        except HermesUnavailable as exc:
+            # A rejected draft is not worth a 15-minute Hermes wait when this
+            # morning's briefing is still good. Transport failures still fall through.
+            if "not usable" in str(exc) and _last_good_briefing() is not None:
+                logger.warning(
+                    "Briefing Apple Intelligence failed (%s chars, %s); keeping last good",
+                    len(apple_prompt),
+                    exc,
+                )
+                raise
+            logger.warning(
+                "Briefing Apple Intelligence failed (%s chars, %s); trying Hermes",
+                len(apple_prompt),
+                exc,
+            )
+    return await ask_hermes(
+        prompt,
+        include_snapshot=False,
+        max_attempts=max_attempts,
+    )
+
+
+def apple_ask_prompt(message: str, context: dict[str, Any] | None) -> str:
+    """Short day snapshot plus the question, capped for the on-device model."""
+    snapshot = context or {}
+    now = snapshot.get("now") if isinstance(snapshot.get("now"), dict) else None
+    if not now:
+        now = local_now_context()
+    raw_cal = [e for e in (snapshot.get("calendar") or []) if isinstance(e, dict)]
+    if raw_cal and "start_local" not in raw_cal[0]:
+        raw_cal = enrich_calendar_for_prompt(raw_cal)
+    tasks = [t for t in (snapshot.get("tasks") or []) if isinstance(t, dict)]
+    question = (message or "").strip()
+    intro = (
+        f"{now.get('weekday')} {now.get('date')} {now.get('time_of_day')} "
+        f"{now.get('timezone')}. Use only listed events and tasks.\n"
+        "Events:\n"
+    )
+    text = _fit_apple_prompt(
+        intro,
+        [_apple_event_line(event) for event in raw_cal],
+        "Tasks:\n",
+        [
+            _apple_task_line(task)
+            for task in tasks
+            if _task_id(task) and _task_name(task)
+        ],
+        f"Question: {question}\nAnswer concisely. Do not invent events, tasks, or times.",
+    )
+    if len(text) > _APPLE_PROMPT_MAX:
+        raise HermesUnavailable(
+            f"Ask prompt is {len(text)} chars; over the on-device limit"
+        )
+    return text
+
+
+async def ask_day(
+    message: str,
+    context: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> AgentReply:
+    """Ask about the day. Apple Intelligence first; Hermes if that call fails."""
+    if get_settings().apple_intelligence:
+        try:
+            return await ask_apple(apple_ask_prompt(message, context))
+        except HermesUnavailable as exc:
+            logger.warning("Ask Apple Intelligence failed (%s); trying Hermes", exc)
+    return await ask_hermes(message, context=context, **kwargs)
 
 
 _JSON_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
@@ -547,6 +1112,7 @@ def parse_briefing_reply(
         if isinstance(parsed_summary, str) and parsed_summary.strip():
             summary = parsed_summary.strip()
         raw_ids = parsed.get("suggested_task_ids") or parsed.get("suggested_tasks")
+    summary = markdown_paragraphs(strip_leading_date(summary))
     return summary, resolve_suggested_task_ids(raw_ids, tasks, summary)
 
 
@@ -603,7 +1169,7 @@ def _usable_briefing(
     *,
     allow_tomorrow: bool = False,
 ) -> Briefing | None:
-    if briefing is None or briefing.source != "hermes":
+    if briefing is None or briefing.source not in MODEL_BRIEFING_SOURCES:
         return None
     if is_failed_model_reply(briefing.summary):
         return None
@@ -704,8 +1270,11 @@ def _nextday_for(date: str) -> Briefing | None:
 def peek_briefing() -> Briefing | None:
     """Return a cached briefing without touching Fantastical or OmniFocus."""
     now = local_now_context()
+    held = _nextday_for(str(now.get("date") or ""))
+    if held is not None:
+        return held
     if int(now.get("hour") or 0) >= _DAY_DONE_HOUR:
-        return _nextday_for(str(now.get("date") or ""))
+        return None
     fresh = _fresh_cached_briefing(force=False)
     if fresh is not None:
         return fresh
@@ -718,9 +1287,18 @@ def _served_cache(context: dict[str, Any], now: dict[str, Any]) -> Briefing | No
     calendar = enrich_calendar_for_prompt(
         [e for e in (context.get("calendar") or []) if isinstance(e, dict)]
     )
-    if day_is_done(calendar, now):
-        return _nextday_for(str(now.get("date") or ""))
-    return _fresh_cached_briefing(force=False)
+    held = _nextday_for(str(now.get("date") or ""))
+    if held is not None:
+        return held
+    tasks = [t for t in (context.get("tasks") or []) if isinstance(t, dict)]
+    if look_ahead_tomorrow(calendar, tasks, now):
+        return None
+    open_cal = omit_finished_events(calendar, _clock_from_now(now))
+    fp = context_fingerprint(open_cal, tasks, now, horizon="today")
+    cached = _fresh_cached_briefing(force=False, context_fp=fp)
+    if cached is None:
+        return None
+    return _repair_cached_opener(cached, tasks)
 
 
 def _tomorrow_label(now: dict[str, Any]) -> dict[str, str]:
@@ -754,12 +1332,80 @@ async def _load_tomorrow_calendar() -> list[dict[str, Any]]:
         return []
 
 
-def _fresh_cached_briefing(*, force: bool) -> Briefing | None:
+def context_fingerprint(
+    events: list[dict[str, Any]],
+    tasks: list[Any],
+    now: dict[str, Any],
+    *,
+    horizon: str,
+) -> str:
+    """Stable hash of the Fantastical + OmniFocus rows that feed a briefing.
+
+    Period is included so morning → afternoon can refresh when the calendar is
+    unchanged. Wall-clock minutes are not, so Apple rewordings alone do not
+    count as a new briefing.
+    """
+    event_rows: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_rows.append(
+            {
+                "id": str(event.get("id") or ""),
+                "title": str(event.get("title") or ""),
+                "start": str(event.get("start") or event.get("start_local") or ""),
+                "end": str(event.get("end") or event.get("end_local") or ""),
+                "all_day": bool(event.get("all_day")),
+            }
+        )
+    event_rows.sort(key=lambda row: (row["start"], row["title"], row["id"]))
+    task_rows: list[dict[str, str]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = _task_id(task)
+        name = _task_name(task)
+        if not task_id or not name:
+            continue
+        task_rows.append(
+            {
+                "id": task_id,
+                "name": name,
+                "due": str(task.get("due") or ""),
+                "defer": str(task.get("defer") or ""),
+                "planned": str(task.get("planned") or ""),
+            }
+        )
+    task_rows.sort(key=lambda row: row["id"])
+    payload = {
+        "date": str(now.get("date") or ""),
+        "period": str(now.get("time_of_day") or ""),
+        "horizon": horizon,
+        "events": event_rows,
+        "tasks": task_rows,
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _fresh_cached_briefing(
+    *,
+    force: bool,
+    context_fp: str | None = None,
+) -> Briefing | None:
     _hydrate_last_good()
     if force or _briefing_cache is None:
         return None
     cached_at, cached = _briefing_cache
-    if time.monotonic() - cached_at < _BRIEFING_TTL_S and _usable_briefing(cached):
+    if _usable_briefing(cached) is None:
+        return None
+    if context_fp:
+        cached_fp = (cached.context_fingerprint or "").strip()
+        if cached_fp and cached_fp == context_fp:
+            return cached
+        if cached_fp and cached_fp != context_fp:
+            return None
+    if time.monotonic() - cached_at < _BRIEFING_TTL_S:
         return cached
     return None
 
@@ -779,11 +1425,56 @@ def _spawn_publish(briefing: Briefing) -> None:
     task.add_done_callback(_publish_tasks.discard)
 
 
+def _remember_briefing(
+    briefing: Briefing,
+    *,
+    plan_tomorrow: bool,
+    today: str,
+) -> Briefing:
+    global _briefing_cache, _briefing_generation
+    _briefing_cache = (time.monotonic(), briefing)
+    _briefing_generation += 1
+    if plan_tomorrow:
+        _save_nextday(today, briefing)
+    else:
+        _save_last_good(briefing)
+    _spawn_publish(briefing)
+    return briefing
+
+
+def _briefing_failure_summary(exc: BaseException) -> str:
+    text = str(exc).lower()
+    if "cannot reach" in text or "connect" in text:
+        return "Hermes is offline. Waiting for the gateway to come back."
+    if "compute error" in text or "api call failed" in text:
+        return "The local model hit a compute error. The briefing will retry when it recovers."
+    return "Hermes is unavailable. The briefing will retry shortly."
+
+
+def _calendar_unavailable_briefing() -> Briefing:
+    """Hold the last briefing when Fantastical did not answer.
+
+    An empty list is a real empty day. A failed read must not be written up
+    as one.
+    """
+    last = _last_good_briefing()
+    if last is not None:
+        return last
+    return Briefing(
+        summary="The calendar couldn't be loaded, so this briefing was held back.",
+        generated_at=datetime.now(TZ).isoformat(),
+        source="fallback",
+    )
+
+
 async def generate_briefing(
     context: dict[str, Any],
     *,
     force: bool = False,
 ) -> Briefing:
+    if context.get("calendar_unavailable"):
+        logger.warning("Skipping briefing; calendar snapshot unavailable")
+        return _calendar_unavailable_briefing()
     now = local_now_context()
     if not force:
         cached = _served_cache(context, now)
@@ -793,18 +1484,169 @@ async def generate_briefing(
         return await _generate_briefing_locked(context, force=force, now=now)
 
 
-_BRIEFING_LAYOUT = (
+_BRIEFING_OPENING = (
     "Write the same kind of briefing as before — full sentences, with reasons — "
     "but as short markdown paragraphs, not one run-on block and not a labelled "
-    "inventory. Start with **weekday date** on its own line. Then 2-4 short "
-    "paragraphs: timed commitments in order and where the free blocks are; "
-    "best use of the main free block (name the task, due/defer/planned date, "
-    "and why it fits or what it sets up); other realistic tasks, each with a "
-    "reason. Bold recommended task names. A short bullet list is fine only for "
-    "several sibling recommendations, and each bullet must still be a full "
-    "sentence with a reason. Do not use labelled section headings. "
+    "inventory. Separate paragraphs with a blank line. Do not open with the date. "
+)
+
+_BRIEFING_LAYOUT = (
+    _BRIEFING_OPENING
+    + "Write 2-4 short paragraphs: timed commitments in order and where the "
+    "free blocks are; best use of the main free block (name a task from the "
+    "list, its due/defer/planned date, and why it fits or what it sets up); "
+    "other tasks from that list only, each with a reason. Bold recommended "
+    "task names. A short bullet list is fine only for several of those tasks, "
+    "and each bullet must still be a full sentence with a reason. Never invent "
+    "a task, project, or inbox. Do not use labelled section headings. "
     "No preamble, no pep talk. Aim for 100-160 words."
 )
+
+_BRIEFING_LAYOUT_EMPTY = (
+    _BRIEFING_OPENING
+    + "The task list is empty. Write 1-3 short paragraphs on timed commitments "
+    "and free blocks only. Do not name, suggest, or invent any task, project, "
+    "inbox, or activity such as email. No bullet list. No preamble. Aim for "
+    "40-80 words."
+)
+
+
+_UNLISTED_WORK = re.compile(
+    r"\b(?:catch(?:ing)? up|pending work|ideal for|good time to|"
+    r"inbox|project\s+\w|e-?mails?|brainstorm)\b",
+    re.IGNORECASE,
+)
+_INVENTED_TASK_LEAD = re.compile(
+    r"quick tasks|realistic tasks|tasks for this time|from your on deck|other tasks",
+    re.IGNORECASE,
+)
+_CLOCK_TIME = re.compile(r"\b\d{1,2}:\d{2}\b")
+
+
+def _mentions_listed_task(text: str, task_names: list[str]) -> bool:
+    lowered = text.casefold()
+    return any(name.casefold() in lowered for name in task_names if name.strip())
+
+
+def _allowed_clock_times(
+    events: list[dict[str, Any]],
+    task_rows: list[dict[str, str]],
+) -> set[str]:
+    found: set[str] = set()
+    for event in events:
+        for key in ("start", "end", "start_local", "end_local"):
+            found.update(_CLOCK_TIME.findall(str(event.get(key) or "")))
+    for task in task_rows:
+        for key in ("due", "defer", "planned"):
+            found.update(_CLOCK_TIME.findall(str(task.get(key) or "")))
+    return found
+
+
+def _drop_invented_task_lines(
+    summary: str,
+    task_names: list[str] | None = None,
+    allowed_times: set[str] | None = None,
+) -> str:
+    """Remove invented tasks, bullets, and clock times that were not listed."""
+    names = task_names or []
+    kept: list[str] = []
+    for line in summary.splitlines():
+        stripped = line.strip()
+        if re.match(r"(?:[-*]|\d+[.)])\s+\S", stripped):
+            if names and _mentions_listed_task(stripped, names):
+                kept.append(line)
+            continue
+        if _INVENTED_TASK_LEAD.search(stripped) and not _mentions_listed_task(stripped, names):
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", stripped)
+        kept_sentences: list[str] = []
+        for part in sentences:
+            if not part:
+                continue
+            if _UNLISTED_WORK.search(part) and not _mentions_listed_task(part, names):
+                continue
+            if allowed_times is not None:
+                mentioned = set(_CLOCK_TIME.findall(part))
+                if mentioned - allowed_times:
+                    continue
+            if not names and re.search(r"\bnext task\b", part, re.I):
+                continue
+            kept_sentences.append(part)
+        if kept_sentences:
+            kept.append(" ".join(kept_sentences))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+def _factual_briefing(
+    events: list[dict[str, Any]],
+    task_rows: list[dict[str, str]],
+    *,
+    tomorrow: bool = False,
+) -> str:
+    if not events and not task_rows:
+        if tomorrow:
+            return "Nothing is on tomorrow's calendar, and that task list is empty."
+        return "Nothing is left on today's calendar, and On Deck is empty."
+    parts: list[str] = []
+    if events:
+        bits = []
+        for event in events:
+            title = event.get("title") or "Untitled"
+            start = event.get("start_local")
+            end = event.get("end_local")
+            when = f"{start}–{end}" if start and end else (start or "")
+            bits.append(f"{title} at {when}".strip() if when else str(title))
+        parts.append("Still ahead: " + "; ".join(bits) + ".")
+    if task_rows:
+        parts.append("On Deck: " + "; ".join(str(row["name"]) for row in task_rows[:3]) + ".")
+    return " ".join(parts)
+
+
+def _apple_event_line(event: dict[str, Any]) -> str:
+    start = event.get("start_local") or "?"
+    end = event.get("end_local")
+    when = start if not end else f"{start}-{end}"
+    return f"{when} {event.get('title') or 'Untitled'}"
+
+
+def _apple_task_line(task: dict[str, Any]) -> str:
+    bits = [str(task.get("id") or ""), str(task.get("name") or "")]
+    for key in ("due", "defer", "planned"):
+        if task.get(key):
+            bits.append(f"{key} {task[key]}")
+    return " | ".join(bits)
+
+
+def _fit_apple_prompt(
+    intro: str,
+    events: list[str],
+    task_intro: str,
+    tasks: list[str],
+    footer: str,
+) -> str:
+    """Drop later events and tasks until the on-device prompt fits."""
+    kept_events = list(events)
+    kept_tasks = list(tasks)
+
+    def render() -> str:
+        notes: list[str] = []
+        if len(kept_events) < len(events):
+            notes.append(f"Showing first {len(kept_events)} of {len(events)} events.")
+        if len(kept_tasks) < len(tasks):
+            notes.append(f"Showing first {len(kept_tasks)} of {len(tasks)} tasks.")
+        note = ("\n" + " ".join(notes)) if notes else ""
+        event_body = "\n".join(kept_events) if kept_events else "(none)"
+        task_body = "\n".join(kept_tasks) if kept_tasks else "(none)"
+        return f"{intro}{event_body}{note}\n{task_intro}{task_body}\n{footer}"
+
+    text = render()
+    while len(text) > _APPLE_PROMPT_MAX and (kept_events or kept_tasks):
+        if kept_tasks:
+            kept_tasks.pop()
+        else:
+            kept_events.pop()
+        text = render()
+    return text
 
 
 def _briefing_prompt(
@@ -815,48 +1657,85 @@ def _briefing_prompt(
     tomorrow: dict[str, str] | None,
     tomorrow_cal: list[dict[str, Any]] | None,
 ) -> str:
-    json_shape = (
-        "Return ONLY JSON with this shape:\n"
-        '{"summary":"markdown prose in short paragraphs; escape newlines as \\n",'
-        '"suggested_task_ids":["id"]}\n'
-        "suggested_task_ids must be 1-3 ids copied exactly from the task "
-        "list above, in the order Antonio should do them next. Use [] if none. "
-        "Do not invent ids."
+    has_tasks = bool(task_rows)
+    listed = json.dumps(task_rows, default=str)[:6000] if has_tasks else "(none)"
+    calendar_body = json.dumps(cal, default=str) if cal else "(none)"
+    tomorrow_body = json.dumps(tomorrow_cal or [], default=str) if tomorrow_cal else "(none)"
+    listed_only = (
+        "Do not mention an event, task, or clock time that is not listed above. "
+        "Events that have already ended are omitted. "
     )
+    layout = _BRIEFING_LAYOUT if has_tasks else _BRIEFING_LAYOUT_EMPTY
+    if has_tasks:
+        json_shape = (
+            "Return ONLY JSON with this shape:\n"
+            '{"summary":"markdown prose in short paragraphs; escape newlines as \\n",'
+            '"suggested_task_ids":["id"]}\n'
+            "suggested_task_ids must be 1-3 ids copied exactly from the task "
+            "list above, in the order Antonio should do them next. Use [] if none. "
+            "Do not invent ids."
+        )
+    else:
+        json_shape = (
+            "Return ONLY JSON with this shape:\n"
+            '{"summary":"markdown prose in short paragraphs; escape newlines as \\n",'
+            '"suggested_task_ids":[]}\n'
+            "The task list is empty, so suggested_task_ids must be []."
+        )
     if tomorrow is None:
+        if has_tasks:
+            cover = (
+                "Cover: remaining free blocks, highest-value On Deck task still "
+                "realistic before the next timed commitment, and one suggested focus. "
+            )
+        else:
+            cover = (
+                "On Deck is empty. Cover remaining free blocks only. "
+                "Do not recommend any task. "
+            )
         return (
             f"{_datetime_rules(now)}\n\n"
-            f"Today's calendar (authoritative):\n{json.dumps(cal, default=str)}\n\n"
-            f"On Deck tasks (use these ids, do not invent):\n"
-            f"{json.dumps(task_rows, default=str)[:6000]}\n\n"
+            f"Today's calendar (authoritative):\n{calendar_body}\n\n"
+            f"On Deck tasks (use these ids, do not invent):\n{listed}\n\n"
             "Produce a short briefing for the next few hours from NOW — not a "
             "generic morning briefing and not a Friday/Shabbat briefing unless "
             "today really is Friday evening or Saturday. "
-            "Cover: remaining free blocks, highest-value On Deck task still "
-            "realistic before the next timed commitment, and one suggested focus. "
+            f"{cover}"
+            f"{listed_only}"
             "Do not mention Shabbat, candle lighting, or breaking a fast unless "
             "those times appear explicitly in the calendar list above for today.\n\n"
-            f"{_BRIEFING_LAYOUT}\n\n"
+            f"{layout}\n\n"
             f"{json_shape}"
+        )
+    if has_tasks:
+        cover = (
+            "Cover: first timed calendar commitment, then the highest-value "
+            "action from that list that fits the morning. Mention due/defer/"
+            "planned dates when they appear. Do not say On Deck is empty as if there "
+            "is no work tomorrow. "
+        )
+    else:
+        cover = (
+            "That perspective is empty. Cover tomorrow's timed commitments only. "
+            "Do not recommend any task. "
         )
     return (
         f"{_datetime_rules(now)}\n\n"
         f"Today's remaining timed calendar is empty. Write a look-ahead for "
         f"TOMORROW {tomorrow['weekday']} {tomorrow['date']} ({tomorrow['human']}), "
         "not a recap of today and not a briefing for the rest of tonight. "
-        "It is correct to plan tomorrow morning even though it is evening now.\n\n"
+        "It is correct to plan tomorrow even though the clock is still today.\n\n"
         f"Tomorrow's calendar (authoritative):\n"
-        f"{json.dumps(tomorrow_cal or [], default=str)}\n\n"
+        f"{tomorrow_body}\n\n"
         f"OmniFocus '{get_settings().omnifocus_tomorrow_perspective}' perspective "
         "(use these ids, do not invent; this is NOT On Deck):\n"
-        f"{json.dumps(task_rows, default=str)[:6000]}\n\n"
-        "Cover: first timed calendar commitment, then the highest-value "
-        "action from that list that fits the morning. Mention due/defer/"
-        "planned dates when they appear. Do not say On Deck is empty as if there "
-        "is no work tomorrow. Name tomorrow's weekday. Do not say those events "
+        f"{listed}\n\n"
+        f"{cover}"
+        f"{listed_only}"
+        "Name tomorrow's weekday. Do not say those events "
         "are today. Do not mention Shabbat, candle lighting, or breaking a fast "
         "unless those times appear explicitly in tomorrow's calendar list.\n\n"
-        f"{_BRIEFING_LAYOUT}\n\n"
+        f"{layout}\n\n"
         f"{json_shape}"
     )
 
@@ -876,8 +1755,12 @@ async def _generate_briefing_locked(
     cal = enrich_calendar_for_prompt(
         [e for e in (context.get("calendar") or []) if isinstance(e, dict)]
     )
+    logger.info(
+        "Briefing calendar: %s",
+        [event.get("title") for event in cal] or "empty",
+    )
     tasks = [t for t in (context.get("tasks") or []) if isinstance(t, dict)]
-    plan_tomorrow = day_is_done(cal, now)
+    plan_tomorrow = look_ahead_tomorrow(cal, tasks, now)
     tomorrow = _tomorrow_label(now) if plan_tomorrow else None
     tomorrow_cal: list[dict[str, Any]] | None = None
     if plan_tomorrow:
@@ -907,61 +1790,116 @@ async def _generate_briefing_locked(
         for t in tasks
         if _task_id(t) and _task_name(t)
     ]
-    prompt = _briefing_prompt(
-        now, cal, task_rows, tomorrow=tomorrow, tomorrow_cal=tomorrow_cal
+    clock = _clock_from_now(now)
+    open_cal = omit_finished_events(cal, clock)
+    prompt_cal = cal if plan_tomorrow else open_cal
+    listed_events = tomorrow_cal or [] if plan_tomorrow else open_cal
+    fingerprint = context_fingerprint(
+        listed_events,
+        tasks,
+        now,
+        horizon="tomorrow" if plan_tomorrow else "today",
     )
+    if not force:
+        cached = _fresh_cached_briefing(force=False, context_fp=fingerprint)
+        if cached is not None:
+            return cached
+    prompt = _briefing_prompt(
+        now,
+        prompt_cal,
+        task_rows,
+        tomorrow=tomorrow,
+        tomorrow_cal=tomorrow_cal,
+    )
+    task_names = [str(row["name"]) for row in task_rows]
+    task_ids = [str(row["id"]) for row in task_rows]
     try:
-        reply = await ask_hermes(
+        try:
+            apple_prompt = apple_briefing_prompt(
+                now,
+                listed_events,
+                task_rows,
+                tomorrow=tomorrow,
+            )
+        except HermesUnavailable:
+            apple_prompt = prompt
+        reply = await _ask_briefing(
             prompt,
-            context={
-                "calendar": cal,
-                "calendar_tomorrow": tomorrow_cal or [],
-                "now": now,
-                "tasks": task_rows,
-                "horizon": "tomorrow" if plan_tomorrow else "today",
-            },
-            include_snapshot=False,
+            apple_prompt=apple_prompt,
             max_attempts=2 if _last_good_briefing() is not None else 5,
+            task_names=task_names,
+            task_ids=task_ids,
         )
         summary, suggested = parse_briefing_reply(reply.reply, tasks)
+        summary = _drop_invented_task_lines(
+            summary,
+            task_names,
+            _allowed_clock_times(listed_events, task_rows),
+        )
+        source = "apple" if reply.model == _APPLE_MODEL else "hermes"
+        if not summary:
+            summary = _factual_briefing(listed_events, task_rows, tomorrow=plan_tomorrow)
+            source = "schedule"
+            suggested = []
+        elif not task_rows:
+            suggested = []
+        else:
+            by_id = {str(row["id"]): str(row["name"]) for row in task_rows}
+            summary = name_dangling_opener(
+                summary,
+                [by_id[tid] for tid in suggested if tid in by_id],
+                all_names=list(by_id.values()),
+            )
         if is_failed_model_reply(summary):
             raise HermesUnavailable(summary[:400])
-        briefing = Briefing(
-            summary=summary,
-            generated_at=datetime.now(TZ).isoformat(),
-            source="hermes",
-            suggested_task_ids=suggested,
-            horizon="tomorrow" if plan_tomorrow else "today",
+        return _remember_briefing(
+            Briefing(
+                summary=summary,
+                generated_at=datetime.now(TZ).isoformat(),
+                source=source,
+                suggested_task_ids=suggested,
+                horizon="tomorrow" if plan_tomorrow else "today",
+                context_fingerprint=fingerprint,
+            ),
+            plan_tomorrow=plan_tomorrow,
+            today=str(now.get("date") or ""),
         )
-        _briefing_cache = (time.monotonic(), briefing)
-        _briefing_generation += 1
-        if plan_tomorrow:
-            _save_nextday(str(now.get("date") or ""), briefing)
-        else:
-            _save_last_good(briefing)
-        _spawn_publish(briefing)
-        return briefing
     except HermesUnavailable as exc:
-        logger.warning("Briefing Hermes failed: %s", exc)
+        unusable = "not usable" in str(exc)
+        if unusable:
+            logger.warning(
+                "Briefing Apple Intelligence rejected (%s); returning last good", exc
+            )
+        else:
+            logger.warning("Briefing Hermes failed: %s", exc)
         if plan_tomorrow:
             planned = _nextday_for(str(now.get("date") or ""))
             if planned is not None:
                 return planned
             logger.warning("Briefing Hermes failed (%s); not substituting today's briefing", exc)
             return Briefing(
-                summary="Hermes is offline. Waiting for the gateway to come back.",
+                summary=_briefing_failure_summary(exc),
                 generated_at=datetime.now(TZ).isoformat(),
                 source="fallback",
                 suggested_task_ids=[str(tasks[0]["id"])] if tasks and tasks[0].get("id") else [],
             )
         last = _last_good_briefing()
         if last is not None:
-            logger.warning("Briefing Hermes failed (%s); returning last good", exc)
-            _briefing_cache = (time.monotonic(), last)
-            return last
+            if not unusable:
+                logger.warning("Briefing Hermes failed (%s); returning last good", exc)
+            repaired = _repair_cached_opener(last, tasks)
+            if unusable and fingerprint and repaired.context_fingerprint != fingerprint:
+                repaired = repaired.model_copy(
+                    update={"context_fingerprint": fingerprint}
+                )
+                _briefing_cache = (time.monotonic(), repaired)
+                _save_last_good(repaired)
+            else:
+                _briefing_cache = (time.monotonic(), repaired)
+            return repaired
 
         return Briefing(
-            summary="Hermes is offline. Waiting for the gateway to come back.",
+            summary=_briefing_failure_summary(exc),
             generated_at=datetime.now(TZ).isoformat(),
             source="fallback",
             suggested_task_ids=[str(tasks[0]["id"])] if tasks and tasks[0].get("id") else [],

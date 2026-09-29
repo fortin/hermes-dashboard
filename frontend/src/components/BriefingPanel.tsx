@@ -2,15 +2,21 @@ import { useQuery, useQueryClient, type Query } from '@tanstack/react-query'
 import { api, type Briefing } from '../api'
 import { MarkdownView } from './MarkdownView'
 
+function isModelBriefing(source: string | undefined): boolean {
+  return source === 'hermes' || source === 'apple' || source === 'schedule'
+}
+
 export const briefingQueryOptions = {
   queryKey: ['briefing'] as const,
   queryFn: () => api.briefing(),
-  staleTime: (query: Query<Briefing>) =>
-    query.state.data?.source === 'hermes' ? 5 * 60_000 : 0,
+  staleTime: (query: Query<Briefing>) => {
+    // Tomorrow look-ahead is stable for the evening; today tracks On Deck.
+    if (query.state.data?.horizon === 'tomorrow') return 30 * 60_000
+    return isModelBriefing(query.state.data?.source) ? 5 * 60_000 : 0
+  },
   refetchInterval: (query: Query<Briefing>) =>
     query.state.data?.source === 'fallback' ? 15_000 : false,
-  refetchOnWindowFocus: (query: Query<Briefing>) =>
-    query.state.data?.source === 'fallback',
+  refetchOnWindowFocus: true,
 }
 
 export function BriefingPanel() {
@@ -34,10 +40,11 @@ export function BriefingPanel() {
       {error && <p className="error-line">{(error as Error).message}</p>}
       {data && (
         <>
-          {isFetching && !isLoading && <p className="muted">Still talking to Hermes…</p>}
+          {isFetching && !isLoading && <p className="muted">Updating briefing…</p>}
           <MarkdownView source={data.summary} className="briefing-body" />
           <p className="muted tiny">
             {data.source === 'fallback' ? 'Offline fallback · ' : ''}
+            {data.source === 'apple' ? 'Apple Intelligence · ' : ''}
             {data.horizon === 'tomorrow' ? 'Tomorrow · ' : ''}
             {new Date(data.generated_at).toLocaleTimeString()}
           </p>

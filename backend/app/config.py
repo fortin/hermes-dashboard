@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     hermes_base_url: str = "http://127.0.0.1:8642/v1"
     hermes_api_key: str = "change-me-local-dev"
     hermes_model: str = "hermes-agent"
+    # Briefing, Ask, and email triage go to the siri CLI. Hermes is the fallback.
+    apple_intelligence: bool = True
+    siri_bin: str = ""
+    siri_shortcut: str = "Ask Apple Intelligence (Private Cloud Compute)"
 
     obsidian_mcp_url: str = "http://127.0.0.1:27123/mcp/"
     obsidian_mcp_token: str = ""

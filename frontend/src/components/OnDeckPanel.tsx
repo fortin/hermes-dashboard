@@ -76,6 +76,7 @@ export function OnDeckPanel() {
       const timer = window.setTimeout(() => setUndo(null), 5000)
       setUndo({ task, timer })
       void qc.invalidateQueries({ queryKey: ['status'] })
+      void qc.invalidateQueries({ queryKey: ['briefing'] })
     },
   })
 
@@ -86,6 +87,7 @@ export function OnDeckPanel() {
       setUndo(null)
       void qc.invalidateQueries({ queryKey: ['tasks'] })
       void qc.invalidateQueries({ queryKey: ['status'] })
+      void qc.invalidateQueries({ queryKey: ['briefing'] })
     },
     onError: (err) => {
       setError(err instanceof Error ? err.message : 'Undo failed')
@@ -98,6 +100,7 @@ export function OnDeckPanel() {
       setDraft('')
       void qc.invalidateQueries({ queryKey: ['tasks'] })
       void qc.invalidateQueries({ queryKey: ['status'] })
+      void qc.invalidateQueries({ queryKey: ['briefing'] })
     },
     onError: (err) => {
       setError(err instanceof Error ? err.message : 'Could not add task')

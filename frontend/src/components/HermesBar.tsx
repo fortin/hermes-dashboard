@@ -5,6 +5,7 @@ import { api, type Briefing } from '../api'
 export function HermesBar() {
   const [value, setValue] = useState('')
   const [reply, setReply] = useState<string | null>(null)
+  const [model, setModel] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const qc = useQueryClient()
@@ -16,9 +17,11 @@ export function HermesBar() {
     setBusy(true)
     setError(null)
     setReply(null)
+    setModel(null)
     try {
       const res = await api.askHermes(message)
       setReply(res.reply)
+      setModel(res.model)
       setValue('')
       // Agent may have touched calendar/email; OF only if user asks Refresh
       void qc.invalidateQueries({ queryKey: ['calendar'] })
@@ -51,6 +54,9 @@ export function HermesBar() {
       {error && <p className="error-line">{error}</p>}
       {reply && (
         <div className="hermes-reply">
+          {model === 'apple-intelligence' && (
+            <p className="muted tiny">Apple Intelligence</p>
+          )}
           <pre>{reply}</pre>
         </div>
       )}
@@ -85,10 +91,11 @@ export function useSseRefresh() {
 
   useEffect(() => {
     const onFocus = () => {
-      // Refresh calendar/email/briefing on focus; leave OF to manual Refresh
-      // or mutations so window focus doesn't hammer OmniJS.
+      // Refresh calendar/email/briefing on focus; leave OF task lists to
+      // manual Refresh or mutations so window focus doesn't hammer OmniJS.
       void qc.invalidateQueries({ queryKey: ['calendar'] })
       void qc.invalidateQueries({ queryKey: ['email'] })
+      void qc.invalidateQueries({ queryKey: ['briefing'] })
     }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)

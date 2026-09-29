@@ -156,9 +156,13 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
         briefing_push.reset_state()
         self._tmp = tempfile.TemporaryDirectory()
         briefing_push._fingerprint_path_override = Path(self._tmp.name) / "fp.txt"
+        briefing_push._context_fingerprint_path_override = (
+            Path(self._tmp.name) / "ctx.txt"
+        )
 
     def tearDown(self):
         briefing_push._fingerprint_path_override = None
+        briefing_push._context_fingerprint_path_override = None
         briefing_push.reset_state()
         self._tmp.cleanup()
 
@@ -193,6 +197,48 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first)
         self.assertTrue(second)
         send.assert_awaited_once()
+
+    async def test_skips_push_when_context_fingerprint_matches(self):
+        with (
+            patch("app.services.briefing_push.get_settings", return_value=_settings()),
+            patch("app.services.briefing_push.local_now_context", return_value=_now()),
+            patch("app.services.pushover.send_message", new=AsyncMock(return_value=True)) as send,
+        ):
+            first = await briefing_push.publish_briefing(
+                _briefing(context_fingerprint="abc123", source="apple")
+            )
+            second = await briefing_push.publish_briefing(
+                _briefing(
+                    summary="Completely different Apple wording about the same day.",
+                    context_fingerprint="abc123",
+                    source="apple",
+                )
+            )
+        self.assertTrue(first)
+        self.assertTrue(second)
+        send.assert_awaited_once()
+
+    async def test_pushes_when_context_fingerprint_changes(self):
+        with (
+            patch("app.services.briefing_push.get_settings", return_value=_settings()),
+            patch("app.services.briefing_push.local_now_context", return_value=_now()),
+            patch("app.services.pushover.send_message", new=AsyncMock(return_value=True)) as send,
+        ):
+            await briefing_push.publish_briefing(
+                _briefing(
+                    summary="Focus on the Kikodo proposal before lunch.",
+                    context_fingerprint="abc123",
+                    source="apple",
+                )
+            )
+            await briefing_push.publish_briefing(
+                _briefing(
+                    summary="Focus on the Kikodo proposal before lunch.",
+                    context_fingerprint="def456",
+                    source="apple",
+                )
+            )
+        self.assertEqual(send.await_count, 2)
 
     async def test_skips_push_when_reordered(self):
         with (
@@ -314,8 +360,9 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.services.briefing_push.get_settings", return_value=_settings()),
             patch("app.services.briefing_push.local_now_context", return_value=_now()),
+            patch("app.services.hermes.peek_briefing", return_value=None),
             patch(
-                "app.services.briefing_push._briefing_context",
+                "app.services.briefing_push.briefing_context",
                 new=AsyncMock(return_value={"now": _now()}),
             ),
             patch(
@@ -352,7 +399,7 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("app.services.hermes.peek_briefing", return_value=None),
             patch(
-                "app.services.briefing_push._briefing_context",
+                "app.services.briefing_push.briefing_context",
                 new=AsyncMock(return_value={"now": _now(time_of_day="night", hour=22)}),
             ),
             patch(

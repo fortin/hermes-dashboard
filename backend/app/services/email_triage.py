@@ -9,8 +9,9 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from ..config import get_settings
 from ..models.schemas import EmailTriageItem, EmailTriageResponse
-from .hermes import HermesUnavailable, ask_hermes, hermes_busy
+from .hermes import HermesUnavailable, _APPLE_PROMPT_MAX, ask_apple, ask_hermes, hermes_busy
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,13 @@ ACCOUNTS = ("gmail", "icloud", "zoho")  # outlook needs Graph/OAuth; skip for no
 PAGE_SIZE = 25
 SEARCH_QUERY = "(not flag seen) or (flag flagged)"
 _TRIAGE_TTL_S = 5 * 60
+_MODEL_SOURCES = frozenset({"hermes", "apple"})
+_APPLE_EMAIL_FOOTER = (
+    'JSON only: {"priority":"high|medium|low|noise",'
+    '"disposition":"urgent_reply|reply|action|waiting|reference|noise",'
+    '"reason":"short","needs_reply":false,"draft_reply":null}\n'
+    "Draft a plain reply only when a human reply is warranted. Do not invent facts."
+)
 _triage_cache: tuple[float, EmailTriageResponse] | None = None
 TZ = ZoneInfo("Asia/Bangkok")
 
@@ -176,6 +184,68 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         return json.loads(m.group(0))
 
 
+def apple_email_prompt(env: dict[str, Any]) -> str:
+    """One message, short enough for the on-device model."""
+    header = (
+        "Triage this one unread or flagged email. "
+        "Ignore promo or newsletter unless action is required.\n"
+        f"id: {env.get('id')}\n"
+        f"account: {env.get('account')}\n"
+        f"from: {env.get('from')}\n"
+        f"subject: {env.get('subject')}\n"
+        f"date: {env.get('date')}\n"
+        "body: "
+    )
+    snippet = re.sub(r"\s+", " ", str(env.get("snippet") or "")).strip()
+    room = _APPLE_PROMPT_MAX - len(header) - len(_APPLE_EMAIL_FOOTER) - 1
+    if room < 80:
+        raise HermesUnavailable("Email prompt header exceeds the on-device limit")
+    if len(snippet) > room:
+        snippet = snippet[:room].rstrip()
+    return f"{header}{snippet}\n{_APPLE_EMAIL_FOOTER}"
+
+
+def _item_from_model(raw: dict[str, Any], base: dict[str, Any]) -> EmailTriageItem:
+    draft = raw.get("draft_reply")
+    if isinstance(draft, str) and not draft.strip():
+        draft = None
+    if draft is not None and not isinstance(draft, str):
+        draft = None
+    return EmailTriageItem(
+        id=str(raw.get("id") or base.get("id") or ""),
+        account=str(raw.get("account") or base.get("account") or ""),
+        subject=str(base.get("subject") or raw.get("subject") or ""),
+        sender=str(base.get("from") or raw.get("from") or ""),
+        date=str(base.get("date") or raw.get("date") or ""),
+        priority=str(raw.get("priority") or "medium"),
+        disposition=str(raw.get("disposition") or "reference"),
+        reason=str(raw.get("reason") or ""),
+        needs_reply=bool(raw.get("needs_reply") or draft),
+        draft_reply=draft,
+        snippet=(base.get("snippet") or "")[:280],
+    )
+
+
+def _rank_items(items: list[EmailTriageItem]) -> list[EmailTriageItem]:
+    items = [item for item in items if item.id and item.account]
+    rank = {"high": 0, "medium": 1, "low": 2, "noise": 3}
+    items.sort(key=lambda item: rank.get(item.priority, 9))
+    return items
+
+
+async def _triage_via_apple(envelopes: list[dict[str, Any]]) -> EmailTriageResponse:
+    items: list[EmailTriageItem] = []
+    for env in envelopes[:15]:
+        reply = await ask_apple(apple_email_prompt(env))
+        parsed = _extract_json_object(reply.reply)
+        items.append(_item_from_model(parsed, env))
+    return EmailTriageResponse(
+        items=_rank_items(items),
+        source="apple",
+        generated_at=datetime.now(TZ).isoformat(),
+    )
+
+
 def _fallback_reason(exc: BaseException | None = None) -> str:
     if hermes_busy():
         return "Hermes busy — heuristic triage only"
@@ -227,7 +297,7 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
     global _triage_cache
     if not force and _triage_cache is not None:
         cached_at, cached = _triage_cache
-        if time.monotonic() - cached_at < _TRIAGE_TTL_S and cached.source == "hermes":
+        if time.monotonic() - cached_at < _TRIAGE_TTL_S and cached.source in _MODEL_SOURCES:
             return cached
 
     accounts = await list_accounts()
@@ -261,6 +331,14 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
         "Be concise. Do not invent facts."
     )
 
+    if get_settings().apple_intelligence:
+        try:
+            result = await _triage_via_apple(envelopes)
+            _triage_cache = (time.monotonic(), result)
+            return result
+        except (HermesUnavailable, json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("Apple Intelligence triage failed (%s); trying Hermes", exc)
+
     if hermes_busy():
         return _heuristic_triage(envelopes, reason=_fallback_reason())
 
@@ -271,35 +349,13 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
         )
         parsed = _extract_json_object(reply.reply)
         by_key = {(e["account"], e["id"]): e for e in envelopes}
-        items: list[EmailTriageItem] = []
-        for raw in parsed.get("items") or []:
-            key = (raw.get("account"), str(raw.get("id")))
-            base = by_key.get(key) or {}
-            draft = raw.get("draft_reply")
-            if isinstance(draft, str) and not draft.strip():
-                draft = None
-            items.append(
-                EmailTriageItem(
-                    id=str(raw.get("id") or base.get("id") or ""),
-                    account=str(raw.get("account") or base.get("account") or ""),
-                    subject=str(base.get("subject") or raw.get("subject") or ""),
-                    sender=str(base.get("from") or raw.get("from") or ""),
-                    date=str(base.get("date") or raw.get("date") or ""),
-                    priority=str(raw.get("priority") or "medium"),
-                    disposition=str(raw.get("disposition") or "reference"),
-                    reason=str(raw.get("reason") or ""),
-                    needs_reply=bool(raw.get("needs_reply") or draft),
-                    draft_reply=draft,
-                    snippet=(base.get("snippet") or "")[:280],
-                )
-            )
-        # Drop empty ids
-        items = [i for i in items if i.id and i.account]
-        # Prefer non-noise first
-        rank = {"high": 0, "medium": 1, "low": 2, "noise": 3}
-        items.sort(key=lambda i: rank.get(i.priority, 9))
+        items = [
+            _item_from_model(raw, by_key.get((raw.get("account"), str(raw.get("id")))) or {})
+            for raw in (parsed.get("items") or [])
+            if isinstance(raw, dict)
+        ]
         result = EmailTriageResponse(
-            items=items,
+            items=_rank_items(items),
             source="hermes",
             generated_at=datetime.now(TZ).isoformat(),
         )
@@ -307,7 +363,7 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
         return result
     except (HermesUnavailable, json.JSONDecodeError, KeyError, TypeError) as exc:
         logger.warning("Hermes triage failed, using heuristic: %s", exc)
-        if _triage_cache is not None and _triage_cache[1].source == "hermes":
+        if _triage_cache is not None and _triage_cache[1].source in _MODEL_SOURCES:
             return _triage_cache[1]
         return _heuristic_triage(envelopes, reason=_fallback_reason(exc))
 
