@@ -149,11 +149,18 @@ class ReviewFilingTests(unittest.TestCase):
             "📁 500 📒 Notes/Gladys",
             filename,
         )
-        uri = omnifocus_agent.advanced_obsidian_uri("My Vault", path)
-        self.assertTrue(uri.startswith("obsidian://adv-uri?"))
-        self.assertIn("vault=My%20Vault", uri)
-        self.assertIn("filepath=", uri)
-        self.assertNotIn(" ", uri)
+        self.assertIn("Gladys/", path)
+        uri = omnifocus_agent.advanced_obsidian_uri(
+            "My Vault", uid="9105001a-dba2-440c-a64f-c0c55ebedafa"
+        )
+        self.assertEqual(
+            uri,
+            "obsidian://adv-uri?vault=My%20Vault&uid=9105001a-dba2-440c-a64f-c0c55ebedafa",
+        )
+        legacy = omnifocus_agent.advanced_obsidian_uri("My Vault", path)
+        self.assertTrue(legacy.startswith("obsidian://adv-uri?"))
+        self.assertIn("filepath=", legacy)
+        self.assertNotIn(" ", legacy)
 
 
 class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
@@ -188,13 +195,16 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
         body = write.await_args.args[1]
         self.assertTrue(path.endswith("2026-09-18-1600 Book table at Kai New Zealand.md"))
         self.assertIn("📁 Reviews/Gladys/", path)
+        self.assertTrue(body.startswith("---\nuid: "))
         self.assertIn("Booked for Friday.", body)
         self.assertIn("https://kai.example", body)
         add.assert_awaited_once()
         args, kwargs = add.await_args
         self.assertEqual(args[0], "Review: Book table at Kai New Zealand")
-        self.assertTrue(str(kwargs.get("note")).startswith("obsidian://adv-uri?"))
-        self.assertIn("filepath=", str(kwargs.get("note")))
+        note = str(kwargs.get("note"))
+        self.assertTrue(note.startswith("obsidian://adv-uri?"))
+        self.assertIn("uid=", note)
+        self.assertNotIn("filepath=", note)
         self.assertEqual(kwargs.get("tags"), ["🔎 Review"])
         self.assertEqual(kwargs.get("defer_date"), "2026-09-18T16:00:00+07:00")
         self.assertIsNone(kwargs.get("project_id"))

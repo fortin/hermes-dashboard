@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -264,7 +265,25 @@ def receipt_path(folder: str, filename: str) -> str:
     return f"{folder.strip().strip('/')}/{filename}"
 
 
-def advanced_obsidian_uri(vault: str, filepath: str) -> str:
+def new_note_uid() -> str:
+    return str(uuid.uuid4())
+
+
+def advanced_obsidian_uri(
+    vault: str,
+    filepath: str | None = None,
+    *,
+    uid: str | None = None,
+) -> str:
+    """Build an Advanced URI. Prefer uid — filepath encoding mangling emoji folders."""
+    if uid:
+        return (
+            "obsidian://adv-uri?"
+            f"vault={quote(vault, safe='')}&"
+            f"uid={quote(uid, safe='')}"
+        )
+    if not filepath:
+        raise ValueError("advanced_obsidian_uri requires uid or filepath")
     return (
         "obsidian://adv-uri?"
         f"vault={quote(vault, safe='')}&"
@@ -278,8 +297,17 @@ def receipt_markdown(
     reply: str,
     *,
     claimed_at: str,
+    uid: str,
 ) -> str:
-    parts = [f"# {task_name.strip() or 'untitled'}", "", f"Claimed: {claimed_at}"]
+    parts = [
+        "---",
+        f"uid: {uid}",
+        "---",
+        "",
+        f"# {task_name.strip() or 'untitled'}",
+        "",
+        f"Claimed: {claimed_at}",
+    ]
     if original.strip():
         parts.extend(["", "## Task", original.strip()])
     parts.extend(["", "## Receipt", (reply or "").strip(), ""])
@@ -299,6 +327,7 @@ async def record_success(
         settings.obsidian_agent_receipt_folder,
         receipt_filename(getattr(task, "name", ""), clock),
     )
+    uid = new_note_uid()
     await obsidian.write_vault_note(
         path,
         receipt_markdown(
@@ -306,6 +335,7 @@ async def record_success(
             original,
             reply_text,
             claimed_at=claimed_at,
+            uid=uid,
         ),
     )
     project_id = getattr(task, "project_id", None) or None
@@ -313,7 +343,7 @@ async def record_success(
     review_tag = settings.omnifocus_review_tag
     created = await omnifocus.add_task(
         review_action_name(getattr(task, "name", "")),
-        note=advanced_obsidian_uri(settings.obsidian_vault_name, path),
+        note=advanced_obsidian_uri(settings.obsidian_vault_name, uid=uid),
         tags=[review_tag],
         defer_date=clock.isoformat(timespec="seconds"),
         project_id=project_id,
