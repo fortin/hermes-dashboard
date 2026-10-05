@@ -8,7 +8,6 @@ from ..services.hermes import (
     ask_day,
     generate_briefing,
     local_now_context,
-    peek_briefing,
 )
 
 router = APIRouter(prefix="/api", tags=["agent"])
@@ -37,12 +36,9 @@ async def agent_ask(body: AgentAsk) -> AgentReply:
 @router.get("/briefing", response_model=Briefing)
 @router.post("/briefing", response_model=Briefing)
 async def briefing(force: bool = Query(False)) -> Briefing:
-    # Always load Fantastical + On Deck and let generate_briefing honor its
-    # context fingerprint. Peek-only served a frozen briefing after OmniFocus
-    # changed (checked-off actions never appeared until force refresh).
-    # Evening look-ahead still short-circuits inside generate/peek once held.
-    if not force:
-        held = peek_briefing()
-        if held is not None and held.horizon == "tomorrow":
-            return held
-    return await generate_briefing(await briefing_context(), force=force)
+    # Always load Fantastical + On Deck. force Refresh also re-reads On Deck
+    # so a stale empty cache cannot keep a held tomorrow plan on screen.
+    return await generate_briefing(
+        await briefing_context(force=force),
+        force=force,
+    )

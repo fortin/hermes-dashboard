@@ -103,6 +103,13 @@ def _normalize_task(raw: dict[str, Any]) -> TaskItem:
     )
 
 
+def cached_on_deck() -> list[TaskItem] | None:
+    """Return the in-memory On Deck snapshot if one exists (even if TTL expired)."""
+    if _on_deck_cache is None:
+        return None
+    return list(_on_deck_cache[1])
+
+
 async def get_on_deck(limit: int = 50, *, force: bool = False) -> list[TaskItem]:
     global _on_deck_cache
     if not force and _on_deck_cache is not None:

@@ -216,11 +216,14 @@ async def publish_briefing(
         return sent
 
 
-async def briefing_context() -> dict[str, Any]:
+async def briefing_context(*, force: bool = False) -> dict[str, Any]:
     """Calendar and On Deck snapshot for a briefing.
 
     A failed calendar read is flagged instead of being passed on as an empty
     day. Callers must not ask Hermes to brief that snapshot.
+
+    Pass ``force=True`` on explicit Refresh so a stale empty On Deck cache
+    (from an earlier evening look-ahead) cannot keep the briefing on tomorrow.
     """
     from . import fantastical, omnifocus
 
@@ -231,30 +234,44 @@ async def briefing_context() -> dict[str, Any]:
         logger.warning("Briefing calendar unavailable: %s", exc)
         return {"calendar_unavailable": True, "error": str(exc), "now": now}
     try:
-        tasks = [t.model_dump() for t in await omnifocus.get_on_deck()]
+        tasks = [
+            t.model_dump() for t in await omnifocus.get_on_deck(force=force)
+        ]
     except Exception as exc:  # noqa: BLE001
         logger.warning("Briefing tasks unavailable: %s", exc)
-        tasks = []
-    logger.info("Briefing snapshot: %s calendar events", len(calendar))
+        # Prefer a recent On Deck cache over pretending the deck is empty —
+        # empty would incorrectly flip the briefing to tomorrow.
+        cached = omnifocus.cached_on_deck()
+        tasks = [t.model_dump() for t in cached] if cached is not None else []
+    logger.info(
+        "Briefing snapshot: %s calendar events, %s On Deck tasks",
+        len(calendar),
+        len(tasks),
+    )
     return {"calendar": calendar, "tasks": tasks, "now": now}
 
 
 async def push_due_briefing() -> None:
     now = local_now_context()
-    from .hermes import generate_briefing, peek_briefing
+    from .hermes import generate_briefing, look_ahead_tomorrow, peek_briefing
 
-    held = peek_briefing()
-    if held is not None and held.horizon == "tomorrow":
+    context = await briefing_context()
+    calendar = [e for e in (context.get("calendar") or []) if isinstance(e, dict)]
+    tasks = [t for t in (context.get("tasks") or []) if isinstance(t, dict)]
+    if look_ahead_tomorrow(calendar, tasks, now):
+        held = peek_briefing()
+        if held is not None and held.horizon == "tomorrow":
+            return
+        await generate_briefing(context, force=False)
         return
     hour = int(now.get("hour") or 0)
     if hour >= 17:
-        if peek_briefing() is not None:
-            return
-        await generate_briefing(await briefing_context(), force=False)
+        # On Deck still has work after 17:00 — keep today's briefing, not tomorrow.
+        await generate_briefing(context, force=False)
         return
     if slot_for(now) is None:
         return
-    await generate_briefing(await briefing_context(), force=False)
+    await generate_briefing(context, force=False)
 
 
 async def run_loop() -> None:

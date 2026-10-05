@@ -23,7 +23,7 @@ from app.services.hermes import (
 
 TASKS = [
     {"id": "aaa", "name": "File expenses"},
-    {"id": "bbb", "name": "Draft Kikodo proposal"},
+    {"id": "bbb", "name": "Draft quarterly proposal"},
     {"id": "ccc", "name": "Call dentist"},
     {"id": "ddd", "name": "Inbox zero"},
 ]
@@ -35,7 +35,7 @@ STILL_AHEAD = {
 }
 
 NOW_MORNING = {
-    "timezone": "Asia/Bangkok",
+    "timezone": "UTC",
     "iso": "2026-09-17T08:05+07:00",
     "date": "2026-09-17",
     "weekday": "Thursday",
@@ -77,7 +77,7 @@ class ParseBriefingReplyTests(unittest.TestCase):
 
     def test_accepts_names_instead_of_ids(self):
         summary, ids = parse_briefing_reply(
-            '{"summary":"Focus.","suggested_task_ids":["Draft Kikodo proposal"]}',
+            '{"summary":"Focus.","suggested_task_ids":["Draft quarterly proposal"]}',
             TASKS,
         )
         self.assertEqual(summary, "Focus.")
@@ -92,10 +92,10 @@ class ParseBriefingReplyTests(unittest.TestCase):
 
     def test_matches_names_in_prose_when_json_missing(self):
         summary, ids = parse_briefing_reply(
-            "Highest-value work: Draft Kikodo proposal, then File expenses.",
+            "Highest-value work: Draft quarterly proposal, then File expenses.",
             TASKS,
         )
-        self.assertIn("Draft Kikodo proposal", summary)
+        self.assertIn("Draft quarterly proposal", summary)
         self.assertEqual(ids, ["bbb", "aaa"])
 
     def test_ignores_short_partial_name_hits(self):
@@ -112,7 +112,7 @@ class ParseBriefingReplyTests(unittest.TestCase):
                     "summary": (
                         "**Thursday 17 September**\n\n"
                         "Lunch is at 13:00, then Caroline class 15:00–16:00.\n\n"
-                        "Best use of the morning: **Draft Kikodo proposal** "
+                        "Best use of the morning: **Draft quarterly proposal** "
                         "(planned 07:00), which sets up the afternoon meeting."
                     ),
                     "suggested_task_ids": ["bbb"],
@@ -121,7 +121,7 @@ class ParseBriefingReplyTests(unittest.TestCase):
             TASKS,
         )
         self.assertIn("Lunch is at 13:00", summary)
-        self.assertIn("**Draft Kikodo proposal**", summary)
+        self.assertIn("**Draft quarterly proposal**", summary)
         self.assertIn("which sets up the afternoon meeting", summary)
         self.assertEqual(ids, ["bbb"])
 
@@ -130,14 +130,14 @@ class ParseBriefingReplyTests(unittest.TestCase):
             '{\n'
             '  "summary": "2026-09-24\n'
             '\n'
-            'Best use of the morning: Draft Kikodo proposal, which sets up the meeting.",\n'
+            'Best use of the morning: Draft quarterly proposal, which sets up the meeting.",\n'
             '  "suggested_task_ids": ["bbb"]\n'
             '}'
         )
         summary, ids = parse_briefing_reply(raw, TASKS)
         self.assertTrue(summary.startswith("Best use of the morning"))
         self.assertNotIn("2026-09-24", summary)
-        self.assertIn("Draft Kikodo proposal", summary)
+        self.assertIn("Draft quarterly proposal", summary)
         self.assertIn("which sets up the meeting", summary)
         self.assertNotIn("suggested_task_ids", summary)
         self.assertEqual(ids, ["bbb"])
@@ -176,7 +176,7 @@ class BriefingPromptFormatTests(unittest.TestCase):
         prompt = _briefing_prompt(
             NOW_MORNING,
             [{"title": "Lunch", "start": "2026-09-17T13:00:00+07:00"}],
-            [{"id": "bbb", "name": "Draft Kikodo proposal"}],
+            [{"id": "bbb", "name": "Draft quarterly proposal"}],
             tomorrow=None,
             tomorrow_cal=None,
         )
@@ -198,7 +198,7 @@ class BriefingPromptFormatTests(unittest.TestCase):
             prompt = _briefing_prompt(
                 NOW_EVENING,
                 [],
-                [{"id": "bbb", "name": "Draft Kikodo proposal"}],
+                [{"id": "bbb", "name": "Draft quarterly proposal"}],
                 tomorrow={
                     "weekday": "Friday",
                     "date": "2026-09-18",
@@ -244,6 +244,26 @@ class BriefingPromptFormatTests(unittest.TestCase):
         self.assertIn("afternoon is free", prose)
         self.assertNotIn("emails", prose.lower())
         self.assertNotIn("pending work", prose.lower())
+
+    def test_rewrites_converted_event_time_to_listed_local_start(self):
+        events = [
+            {"title": "Caroline class", "start_local": "00:00", "end_local": "01:00"},
+            {"title": "Caroline class", "start_local": "14:00", "end_local": "15:00"},
+            {"title": "Caroline class", "start_local": "23:00", "end_local": "00:00"},
+        ]
+        summary = hermes.correct_event_clocks(
+            "**Caroline class** at 06:00 is the first timed commitment, requiring an early start. "
+            "**Clean pre-filters** are scheduled for 07:00.",
+            events,
+        )
+        self.assertIn("**Caroline class** at 00:00 is the first", summary)
+        self.assertNotIn("06:00", summary)
+        self.assertIn("07:00", summary)
+        kept = hermes.correct_event_clocks(
+            "**Caroline class** at 14:00 is the afternoon session.",
+            events,
+        )
+        self.assertIn("at 14:00", kept)
 
     def test_drops_past_events_and_unlisted_on_deck_items(self):
         clock = datetime.fromisoformat("2026-09-24T15:11:00+07:00")
@@ -322,7 +342,7 @@ class FailedModelReplyTests(unittest.TestCase):
         self.assertTrue(hermes.is_failed_model_reply("  "))
 
     def test_accepts_real_briefing(self):
-        self.assertFalse(hermes.is_failed_model_reply("Focus on the Kikodo proposal."))
+        self.assertFalse(hermes.is_failed_model_reply("Focus on the quarterly proposal."))
 
     def test_rejects_provider_compute_error(self):
         self.assertTrue(
@@ -393,6 +413,32 @@ class DayIsDoneTests(unittest.TestCase):
         self.assertTrue(day_is_done(calendar, NOW_EVENING))
 
 
+class LookAheadTomorrowTests(unittest.TestCase):
+    def test_evening_with_on_deck_stays_today(self):
+        self.assertFalse(hermes.look_ahead_tomorrow([], TASKS, NOW_EVENING))
+
+    def test_evening_with_empty_deck_plans_tomorrow(self):
+        self.assertTrue(hermes.look_ahead_tomorrow([], [], NOW_EVENING))
+
+    def test_afternoon_with_empty_deck_and_open_event_stays_today(self):
+        still_ahead = {
+            "title": "Caroline class",
+            "start": "2026-09-17T16:00:00+07:00",
+            "end": "2026-09-17T17:00:00+07:00",
+        }
+        self.assertFalse(
+            hermes.look_ahead_tomorrow([still_ahead], [], NOW_AFTERNOON)
+        )
+
+    def test_afternoon_with_empty_deck_and_no_open_events_plans_tomorrow(self):
+        past = {
+            "title": "Lunch",
+            "start": "2026-09-17T12:00:00+07:00",
+            "end": "2026-09-17T13:00:00+07:00",
+        }
+        self.assertTrue(hermes.look_ahead_tomorrow([past], [], NOW_AFTERNOON))
+
+
 class HolidayCalendarFilterTests(unittest.TestCase):
     def test_drops_named_holiday_calendars(self):
         events = [
@@ -401,7 +447,7 @@ class HolidayCalendarFilterTests(unittest.TestCase):
                 "start": "2026-09-19T00:00:00+07:00",
                 "end": "2026-09-20T00:00:00+07:00",
                 "all_day": True,
-                "calendar": "Jewish Holidays",
+                "calendar": "Public Holidays",
             },
             {
                 "title": "Bank Holiday",
@@ -481,25 +527,25 @@ class HolidayCalendarFilterTests(unittest.TestCase):
         kept = enrich_calendar_for_prompt(
             [
                 {
-                    "title": "Yom Kippur",
+                    "title": "National Day",
                     "start": "2026-09-19T00:00:00+07:00",
                     "end": "2026-09-20T00:00:00+07:00",
                     "all_day": True,
-                    "calendar": "iCloud / Jewish Holidays",
+                    "calendar": "iCloud / Public Holidays",
                 }
             ]
         )
         self.assertEqual(kept, [])
 
-    def test_drops_erev_once_calendar_title_is_resolved(self):
+    def test_drops_holiday_once_calendar_title_is_resolved(self):
         kept = enrich_calendar_for_prompt(
             [
                 {
-                    "title": "Erev Yom Kippur",
+                    "title": "Holiday Eve",
                     "start": "2026-09-20T00:00:00+07:00",
                     "end": "2026-09-21T00:00:00+07:00",
                     "all_day": True,
-                    "calendar": "Jewish Holidays",
+                    "calendar": "Public Holidays",
                 },
                 {
                     "title": "Weekly Review",
@@ -583,21 +629,26 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
                     ],
                     "tasks": [],
                     "tasks_tomorrow": [
-                        {"id": "bbb", "name": "Draft Kikodo proposal"}
+                        {"id": "bbb", "name": "Draft quarterly proposal"}
                     ],
                 },
                 force=True,
             )
         self.assertEqual(len(seen), 1)
         self.assertIn("Caroline class", seen[0])
-        self.assertIn("Draft Kikodo proposal", seen[0])
+        self.assertIn("Draft quarterly proposal", seen[0])
         self.assertIn("Tomorrow > 5 minutes", seen[0])
         self.assertNotIn("Lunch", seen[0])
         self.assertEqual(briefing.horizon, "tomorrow")
         self.assertIn("Caroline", briefing.summary)
         self.assertEqual(briefing.suggested_task_ids, ["bbb"])
 
-        ask_again = AsyncMock()
+        ask_again = AsyncMock(
+            return_value=AgentReply(
+                reply='{"summary":"**File expenses** before the evening winds down.","suggested_task_ids":["aaa"]}',
+                model="x",
+            )
+        )
         with (
             patch.object(hermes, "ask_hermes", ask_again),
             patch.object(hermes, "_spawn_publish"),
@@ -606,11 +657,12 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "calendar": [STILL_AHEAD],
                     "tasks": TASKS,
-                }
+                },
+                force=True,
             )
-        ask_again.assert_not_awaited()
-        self.assertEqual(again.summary, briefing.summary)
-        self.assertEqual(again.horizon, "tomorrow")
+        ask_again.assert_awaited()
+        self.assertEqual(again.horizon, "today")
+        self.assertIn("File expenses", again.summary)
 
     async def test_unavailable_calendar_is_not_briefed_as_an_empty_day(self):
         ask = AsyncMock()
@@ -621,7 +673,24 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("couldn't be loaded", briefing.summary)
         self.assertNotIn("nothing", briefing.summary.lower())
 
-    def test_peek_ignores_today_briefing_in_the_evening(self):
+    def test_peek_ignores_stale_today_briefing_in_the_evening(self):
+        self._now_patch.stop()
+        self._now_patch = patch.object(
+            hermes, "local_now_context", return_value=NOW_EVENING
+        )
+        self._now_patch.start()
+        hermes._briefing_cache = (
+            time.monotonic() - hermes._BRIEFING_TTL_S - 1,
+            Briefing(
+                summary="On Deck: empty — no queued tasks.",
+                generated_at="2026-09-17T16:27:00+07:00",
+                source="hermes",
+                horizon="today",
+            ),
+        )
+        self.assertIsNone(hermes.peek_briefing())
+
+    def test_peek_serves_fresh_today_briefing_in_the_evening(self):
         self._now_patch.stop()
         self._now_patch = patch.object(
             hermes, "local_now_context", return_value=NOW_EVENING
@@ -630,13 +699,16 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
         hermes._briefing_cache = (
             time.monotonic(),
             Briefing(
-                summary="On Deck: empty — no queued tasks.",
-                generated_at="2026-09-17T20:27:00+07:00",
+                summary="**File expenses** with the time left today.",
+                generated_at="2026-09-17T20:30:00+07:00",
                 source="hermes",
                 horizon="today",
             ),
         )
-        self.assertIsNone(hermes.peek_briefing())
+        peeked = hermes.peek_briefing()
+        self.assertIsNotNone(peeked)
+        self.assertEqual(peeked.horizon, "today")
+        self.assertIn("File expenses", peeked.summary)
 
     async def test_concurrent_calls_share_one_hermes_run(self):
         calls = 0
@@ -836,11 +908,11 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
                     "all_day": False,
                 }
             ],
-            "tasks": TASKS,
+            "tasks": [],
             "tasks_tomorrow": [
                 {
                     "id": "bbb",
-                    "name": "Draft Kikodo proposal",
+                    "name": "Draft quarterly proposal",
                     "due": "2026-09-18",
                     "defer": None,
                     "planned": "2026-09-18",
@@ -860,7 +932,7 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.summary, first.summary)
         self.assertIn("TOMORROW", prompts[0])
         self.assertIn("Caroline class", prompts[0])
-        self.assertIn("Draft Kikodo proposal", prompts[0])
+        self.assertIn("Draft quarterly proposal", prompts[0])
         self.assertIn("Tomorrow > 5 minutes", prompts[0])
         self.assertNotIn("File expenses", prompts[0])
         self.assertFalse(hermes.last_good_path().exists())
@@ -904,6 +976,107 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again.horizon, "tomorrow")
         self.assertIn("Caroline", again.summary)
 
+    async def test_evening_with_on_deck_stays_today(self):
+        self._now_patch.stop()
+        self._now_patch = patch.object(
+            hermes, "local_now_context", return_value=NOW_EVENING
+        )
+        self._now_patch.start()
+        prompts: list[str] = []
+
+        async def fake_ask(message, *_a, **_k):
+            prompts.append(message)
+            return AgentReply(
+                reply='{"summary":"**File expenses** before the evening winds down.","suggested_task_ids":["aaa"]}',
+                model="x",
+            )
+
+        with (
+            patch.object(hermes, "ask_hermes", fake_ask),
+            patch.object(hermes, "_spawn_publish"),
+        ):
+            briefing = await hermes.generate_briefing(
+                {
+                    "calendar": [],
+                    "calendar_tomorrow": [
+                        {
+                            "title": "Caroline class",
+                            "start": "2026-09-18T09:00:00+07:00",
+                            "end": "2026-09-18T10:00:00+07:00",
+                        }
+                    ],
+                    "tasks": TASKS,
+                    "tasks_tomorrow": [
+                        {"id": "bbb", "name": "Draft quarterly proposal"}
+                    ],
+                },
+                force=True,
+            )
+        self.assertEqual(briefing.horizon, "today")
+        self.assertIn("File expenses", briefing.summary)
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn("TOMORROW", prompts[0])
+        self.assertIn("File expenses", prompts[0])
+        self.assertNotIn("Caroline class", prompts[0])
+
+    async def test_held_tomorrow_reverts_when_on_deck_has_tasks(self):
+        self._now_patch.stop()
+        self._now_patch = patch.object(
+            hermes, "local_now_context", return_value=NOW_EVENING
+        )
+        self._now_patch.start()
+
+        async def fake_tomorrow(*_a, **_k):
+            return AgentReply(
+                reply='{"summary":"Friday morning: Caroline first.","suggested_task_ids":["bbb"]}',
+                model="x",
+            )
+
+        empty = {
+            "calendar": [],
+            "calendar_tomorrow": [
+                {
+                    "title": "Caroline class",
+                    "start": "2026-09-18T09:00:00+07:00",
+                    "end": "2026-09-18T10:00:00+07:00",
+                }
+            ],
+            "tasks": [],
+            "tasks_tomorrow": [
+                {"id": "bbb", "name": "Draft quarterly proposal"}
+            ],
+        }
+        with (
+            patch.object(hermes, "ask_hermes", fake_tomorrow),
+            patch.object(hermes, "_spawn_publish"),
+        ):
+            held = await hermes.generate_briefing(empty)
+        self.assertEqual(held.horizon, "tomorrow")
+
+        async def fake_today(message, *_a, **_k):
+            return AgentReply(
+                reply='{"summary":"**File expenses** with the time left today.","suggested_task_ids":["aaa"]}',
+                model="x",
+            )
+
+        with (
+            patch.object(hermes, "ask_hermes", fake_today),
+            patch.object(hermes, "_spawn_publish"),
+        ):
+            # Refresh without force: held tomorrow must not win over On Deck work.
+            again = await hermes.generate_briefing(
+                {"calendar": [], "tasks": TASKS},
+                force=False,
+            )
+        self.assertEqual(again.horizon, "today")
+        self.assertIn("File expenses", again.summary)
+        self.assertIsNone(hermes._nextday_for("2026-09-17"))
+        self.assertFalse(hermes.nextday_path().exists())
+        # SSE must not resurrect tomorrow after a today regen.
+        peek = hermes.peek_briefing()
+        self.assertIsNotNone(peek)
+        self.assertEqual(peek.horizon, "today")
+
     async def test_evening_failure_does_not_return_today_briefing(self):
         self._now_patch.stop()
         self._now_patch = patch.object(
@@ -931,9 +1104,9 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "calendar": [],
                     "calendar_tomorrow": [],
-                    "tasks": TASKS,
+                    "tasks": [],
                     "tasks_tomorrow": [
-                        {"id": "bbb", "name": "Draft Kikodo proposal"}
+                        {"id": "bbb", "name": "Draft quarterly proposal"}
                     ],
                 },
                 force=True,
@@ -1210,7 +1383,7 @@ class GenerateBriefingCoalesceTests(unittest.IsolatedAsyncioTestCase):
             second = await hermes.generate_briefing(
                 {
                     "calendar": [STILL_AHEAD],
-                    "tasks": [{"id": "bbb", "name": "Draft Kikodo proposal"}],
+                    "tasks": [{"id": "bbb", "name": "Draft quarterly proposal"}],
                 }
             )
         self.assertEqual(calls, 2)
@@ -1249,6 +1422,12 @@ class AskDayTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AskAppleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        hermes._apple_model_down_until = 0.0
+
+    def tearDown(self) -> None:
+        hermes._apple_model_down_until = 0.0
+
     async def test_reads_raw_stdout(self):
         proc = AsyncMock()
         proc.returncode = 0
@@ -1290,6 +1469,25 @@ class AskAppleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(hermes.HermesUnavailable) as caught:
                 await hermes.ask_apple("hi")
         self.assertIn("shortcut missing", str(caught.exception))
+        self.assertEqual(hermes._apple_model_down_until, 0.0)
+
+    async def test_model_error_skips_the_next_shortcut_run(self):
+        proc = AsyncMock()
+        proc.returncode = 1
+        proc.communicate = AsyncMock(
+            return_value=(b"", b"Error: An error occurred when running the model.")
+        )
+        spawn = AsyncMock(return_value=proc)
+        with (
+            patch.object(hermes, "siri_binary", return_value=Path("/usr/bin/siri")),
+            patch.object(hermes.asyncio, "create_subprocess_exec", spawn),
+        ):
+            with self.assertRaises(hermes.HermesUnavailable):
+                await hermes.ask_apple("hi")
+            with self.assertRaises(hermes.HermesUnavailable) as caught:
+                await hermes.ask_apple("again")
+        self.assertIn("cooling down", str(caught.exception))
+        self.assertEqual(spawn.await_count, 1)
 
 
 if __name__ == "__main__":
