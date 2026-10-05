@@ -16,7 +16,12 @@ class Settings(BaseSettings):
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8787
 
-    database_url: str = "postgresql+asyncpg://antonio@127.0.0.1:5432/hermesdashboard"
+    # Prefer setting DATABASE_URL in .env; this is only a local-dev fallback.
+    database_url: str = "postgresql+asyncpg://postgres@127.0.0.1:5432/hermesdashboard"
+
+    # Used in Hermes / Apple Intelligence prompts.
+    owner_name: str = "you"
+    agent_name: str = "Gladys"
 
     hermes_base_url: str = "http://127.0.0.1:8642/v1"
     hermes_api_key: str = "change-me-local-dev"
@@ -25,9 +30,16 @@ class Settings(BaseSettings):
     apple_intelligence: bool = True
     siri_bin: str = ""
     siri_shortcut: str = "Ask Apple Intelligence (Private Cloud Compute)"
+    # Repo-root relative (or absolute) path to optional prompt rules.
+    hermes_rules_path: str = "hermes-rules.local"
+
+    # Empty = auto (DB preference → system IANA → UTC).
+    dashboard_timezone: str = ""
 
     obsidian_mcp_url: str = "http://127.0.0.1:27123/mcp/"
     obsidian_mcp_token: str = ""
+    # Absolute filesystem path to the vault (dataview file scans). Empty disables.
+    obsidian_vault_path: str = ""
     obsidian_daily_folder: str = (
         "📁 500 📒 Notes/📁 510 🧹 Maintenance/📁 511 🔍 Reviews/1. Daily"
     )
