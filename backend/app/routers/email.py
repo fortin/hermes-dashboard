@@ -1,6 +1,6 @@
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
+from ..localtime import get_tz
 from fastapi import APIRouter, HTTPException, Query
 
 from ..models.schemas import (
@@ -13,7 +13,6 @@ from ..services.dataview import resolve_dataview_block_async
 from ..services.email_triage import delete_message, send_reply, triage_inbox
 
 router = APIRouter(prefix="/api", tags=["email-dataview"])
-TZ = ZoneInfo("Asia/Bangkok")
 
 
 @router.post("/dataview/resolve", response_model=DataviewResolveResponse)
@@ -28,7 +27,7 @@ async def get_email_triage(force: bool = Query(False)) -> EmailTriageResponse:
     try:
         result = await triage_inbox(force=force)
         if not result.generated_at:
-            result.generated_at = datetime.now(TZ).isoformat()
+            result.generated_at = datetime.now(get_tz()).isoformat()
         return result
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc

@@ -5,6 +5,7 @@ import { DailyNotePanel } from './components/DailyNotePanel'
 import { EmailPanel } from './components/EmailPanel'
 import { HermesBar, useSseRefresh } from './components/HermesBar'
 import { OnDeckPanel } from './components/OnDeckPanel'
+import { TimezoneSelect } from './components/TimezoneSelect'
 import './App.css'
 
 const queryClient = new QueryClient({
@@ -30,6 +31,7 @@ function Dashboard() {
         <div>
           <p className="brand">Hermes Dashboard</p>
           <h1>{today}</h1>
+          <TimezoneSelect />
         </div>
         <HermesBar />
       </header>

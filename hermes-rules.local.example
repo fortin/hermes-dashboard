@@ -1,0 +1,20 @@
+# Optional prompt rules appended to Hermes / Apple Intelligence system context.
+# Copy to hermes-rules.local (gitignored) and edit. Placeholders:
+#   {weekday} {date} {human} {timezone} {time_of_day} {hour} {minute}
+#   {next_shabbat_starts_on} {is_shabbat}
+#
+# Leave the file absent for generic clock-only rules.
+
+Next Shabbat for this locale begins on Friday {next_shabbat_starts_on}
+(sunset Friday → dusk Saturday). is_shabbat={is_shabbat}.
+
+Rules you MUST follow:
+1. Do not invent weekday, date, or religious timing. Never say Shabbat is
+   starting tonight unless is_shabbat is true or the clock is Friday evening.
+2. Holiday calendars are omitted from the snapshot (Jewish, Thai, UK, Swiss,
+   Spanish, and generic public holidays). Do not mention those holidays, fasts,
+   or observances, and do not treat them as Shabbat.
+3. Only mention calendar events listed in the snapshot, with their listed
+   weekday and times. Do not add holidays or candle-lighting times that are
+   not listed.
+4. Match tone to the actual time_of_day; never write a morning briefing at night.

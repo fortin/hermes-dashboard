@@ -7,8 +7,7 @@ from zoneinfo import ZoneInfo
 from app.models.schemas import AgentReply, TaskItem
 from app.services import omnifocus, omnifocus_agent
 from app.services.omnifocus_agent import AgentTags
-
-TZ = ZoneInfo("Asia/Bangkok")
+TZ = ZoneInfo("UTC")
 TAGS = AgentTags()
 NOW = datetime(2026, 9, 18, 16, 0, tzinfo=TZ)
 
@@ -16,7 +15,7 @@ NOW = datetime(2026, 9, 18, 16, 0, tzinfo=TZ)
 def _task(**overrides) -> TaskItem:
     data = dict(
         id="t1",
-        name="add to places - korean bbq",
+        name="add to places - neighborhood cafe",
         note="https://example.com",
         tags=["🤖 Gladys"],
         planned=None,
@@ -31,27 +30,27 @@ class PlannedEligibilityTests(unittest.TestCase):
 
     def test_past_planned_is_eligible(self):
         self.assertTrue(
-            omnifocus_agent.planned_is_due("2026-09-18T15:59:00+07:00", NOW)
+            omnifocus_agent.planned_is_due("2026-09-18T15:59:00+00:00", NOW)
         )
 
     def test_planned_exactly_now_is_eligible(self):
         self.assertTrue(
-            omnifocus_agent.planned_is_due("2026-09-18T16:00:00+07:00", NOW)
+            omnifocus_agent.planned_is_due("2026-09-18T16:00:00+00:00", NOW)
         )
 
     def test_future_planned_is_not_eligible(self):
         self.assertFalse(
-            omnifocus_agent.planned_is_due("2026-09-18T16:01:00+07:00", NOW)
+            omnifocus_agent.planned_is_due("2026-09-18T16:01:00+00:00", NOW)
         )
 
     def test_date_only_today_is_eligible(self):
         self.assertTrue(
-            omnifocus_agent.planned_is_due("2026-09-18T00:00:00+07:00", NOW)
+            omnifocus_agent.planned_is_due("2026-09-18T00:00:00+00:00", NOW)
         )
 
     def test_date_only_tomorrow_is_not_eligible(self):
         self.assertFalse(
-            omnifocus_agent.planned_is_due("2026-09-19T00:00:00+07:00", NOW)
+            omnifocus_agent.planned_is_due("2026-09-19T00:00:00+00:00", NOW)
         )
 
 
@@ -62,7 +61,7 @@ class QueueSelectionTests(unittest.TestCase):
             _task(id="blocked", tags=["gladys-blocked"]),
             _task(id="failed", tags=["gladys-failed"]),
             _task(id="done", tags=["gladys-done"]),
-            _task(id="later", tags=["🤖 Gladys"], planned="2026-09-18T18:00:00+07:00"),
+            _task(id="later", tags=["🤖 Gladys"], planned="2026-09-18T18:00:00+00:00"),
             _task(id="ready", tags=["🤖 Gladys", "errand"]),
             _task(id="also", tags=["🤖 Gladys"]),
         ]
@@ -79,7 +78,7 @@ class QueueSelectionTests(unittest.TestCase):
         self.assertEqual(picked.id, "blocked")
 
     def test_empty_when_nothing_ready(self):
-        tasks = [_task(id="later", planned="2026-09-19T09:00:00+07:00")]
+        tasks = [_task(id="later", planned="2026-09-19T09:00:00+00:00")]
         self.assertIsNone(omnifocus_agent.pick_eligible(tasks, TAGS, NOW))
 
 
@@ -127,12 +126,12 @@ class TagAndNoteTests(unittest.TestCase):
 
     def test_receipt_keeps_original_above_the_line(self):
         text = omnifocus_agent.format_receipt(
-            "Added Nubiani to Places.",
-            claimed_at="2026-09-18T16:02+07:00",
+            "Added Harbor Cafe to Places.",
+            claimed_at="2026-09-18T16:02+00:00",
         )
         self.assertIn(omnifocus_agent.LOG_DELIMITER, text)
-        self.assertIn("Added Nubiani to Places.", text)
-        self.assertIn("2026-09-18T16:02+07:00", text)
+        self.assertIn("Added Harbor Cafe to Places.", text)
+        self.assertIn("2026-09-18T16:02+00:00", text)
 
 
 class ReviewFilingTests(unittest.TestCase):
@@ -170,7 +169,7 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             obsidian_agent_receipt_folder="📁 Reviews/Gladys",
             omnifocus_review_tag="🔎 Review",
         )
-        task = _task(name="Book table at Kai New Zealand")
+        task = _task(name="Book table at Riverside Bistro")
         with (
             patch.object(omnifocus_agent, "get_settings", return_value=settings),
             patch.object(
@@ -187,26 +186,26 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             await omnifocus_agent.record_success(
                 task,
                 "Booked for Friday.\nSTATUS: done",
-                claimed_at="2026-09-18T16:00+07:00",
+                claimed_at="2026-09-18T16:00+00:00",
                 clock=NOW,
                 original="https://kai.example",
             )
         path = write.await_args.args[0]
         body = write.await_args.args[1]
-        self.assertTrue(path.endswith("2026-09-18-1600 Book table at Kai New Zealand.md"))
+        self.assertTrue(path.endswith("2026-09-18-1600 Book table at Riverside Bistro.md"))
         self.assertIn("📁 Reviews/Gladys/", path)
         self.assertTrue(body.startswith("---\nuid: "))
         self.assertIn("Booked for Friday.", body)
         self.assertIn("https://kai.example", body)
         add.assert_awaited_once()
         args, kwargs = add.await_args
-        self.assertEqual(args[0], "Review: Book table at Kai New Zealand")
+        self.assertEqual(args[0], "Review: Book table at Riverside Bistro")
         note = str(kwargs.get("note"))
         self.assertTrue(note.startswith("obsidian://adv-uri?"))
         self.assertIn("uid=", note)
         self.assertNotIn("filepath=", note)
         self.assertEqual(kwargs.get("tags"), ["🔎 Review"])
-        self.assertEqual(kwargs.get("defer_date"), "2026-09-18T16:00:00+07:00")
+        self.assertEqual(kwargs.get("defer_date"), "2026-09-18T16:00:00+00:00")
         self.assertIsNone(kwargs.get("project_id"))
         self.assertIsNone(kwargs.get("project_name"))
 
@@ -222,13 +221,13 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
                 "items": [
                     {
                         "id": "review-1",
-                        "name": "Review: Book table at Kai New Zealand",
+                        "name": "Review: Book table at Riverside Bistro",
                         "tags": ["(Waiting)", "🔎 Review"],
                     }
                 ]
             },
         }
-        task = _task(name="Book table at Kai New Zealand", project_id="p-places")
+        task = _task(name="Book table at Riverside Bistro", project_id="p-places")
         with (
             patch.object(omnifocus_agent, "get_settings", return_value=settings),
             patch.object(
@@ -250,7 +249,7 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             await omnifocus_agent.record_success(
                 task,
                 "Booked for Friday.\nSTATUS: done",
-                claimed_at="2026-09-18T16:00+07:00",
+                claimed_at="2026-09-18T16:00+00:00",
                 clock=NOW,
             )
         set_tags.assert_awaited_once_with("review-1", ["🔎 Review"])
@@ -283,7 +282,7 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             await omnifocus_agent.record_success(
                 task,
                 "Booked.\nSTATUS: done",
-                claimed_at="2026-09-18T16:00+07:00",
+                claimed_at="2026-09-18T16:00+00:00",
                 clock=NOW,
             )
         set_tags.assert_not_awaited()
@@ -295,7 +294,7 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             omnifocus_review_tag="🔎 Review",
         )
         task = _task(
-            name="Add Nubiani to Places",
+            name="Add Harbor Cafe to Places",
             project="Places",
             project_id="p-places",
         )
@@ -315,7 +314,7 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             await omnifocus_agent.record_success(
                 task,
                 "Added.\nSTATUS: done",
-                claimed_at="2026-09-18T16:00+07:00",
+                claimed_at="2026-09-18T16:00+00:00",
                 clock=NOW,
             )
         kwargs = add.await_args.kwargs
@@ -328,7 +327,7 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             obsidian_agent_receipt_folder="📁 Reviews/Gladys",
             omnifocus_review_tag="🔎 Review",
         )
-        task = _task(name="Add Nubiani to Places", project="Places")
+        task = _task(name="Add Harbor Cafe to Places", project="Places")
         with (
             patch.object(omnifocus_agent, "get_settings", return_value=settings),
             patch.object(
@@ -345,7 +344,7 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
             await omnifocus_agent.record_success(
                 task,
                 "Added.\nSTATUS: done",
-                claimed_at="2026-09-18T16:00+07:00",
+                claimed_at="2026-09-18T16:00+00:00",
                 clock=NOW,
             )
         kwargs = add.await_args.kwargs
@@ -356,13 +355,13 @@ class RecordSuccessTests(unittest.IsolatedAsyncioTestCase):
 class OutcomeMessageTests(unittest.TestCase):
     def test_done_includes_task_and_receipt(self):
         title, body = omnifocus_agent.outcome_message(
-            "add to places - korean bbq",
+            "add to places - neighborhood cafe",
             "done",
-            "Added Nubiani to Places.\nSTATUS: done",
+            "Added Harbor Cafe to Places.\nSTATUS: done",
         )
         self.assertEqual(title, "Gladys · done")
-        self.assertIn("add to places - korean bbq", body)
-        self.assertIn("Added Nubiani to Places.", body)
+        self.assertIn("add to places - neighborhood cafe", body)
+        self.assertIn("Added Harbor Cafe to Places.", body)
         self.assertNotIn("STATUS:", body)
 
     def test_blocked_keeps_the_reason(self):
@@ -464,7 +463,7 @@ class TickTests(unittest.IsolatedAsyncioTestCase):
                 "execute_delegated_task",
                 new=AsyncMock(
                     return_value=AgentReply(
-                        reply="Added Nubiani.\nSTATUS: done",
+                        reply="Added Harbor Cafe.\nSTATUS: done",
                         model="hermes-agent",
                     )
                 ),
@@ -481,7 +480,7 @@ class TickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "done")
         execute.assert_awaited_once()
         prompt = execute.await_args.args[0]
-        self.assertIn("add to places - korean bbq", prompt)
+        self.assertIn("add to places - neighborhood cafe", prompt)
         self.assertIn("https://example.com", prompt)
         set_tags.assert_any_await("t1", ["gladys-running"])
         set_tags.assert_any_await("t1", ["gladys-done"])
@@ -493,7 +492,7 @@ class TickTests(unittest.IsolatedAsyncioTestCase):
         self.notify.assert_awaited_once()
         self.assertEqual(
             self.notify.await_args.args[:2],
-            ("add to places - korean bbq", "done"),
+            ("add to places - neighborhood cafe", "done"),
         )
 
     async def test_still_completes_when_success_filing_fails(self):
@@ -633,7 +632,7 @@ class TickTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_peek_queue_names_the_next_task(self):
         ready = _task()
-        later = _task(id="later", planned="2026-09-18T18:00:00+07:00")
+        later = _task(id="later", planned="2026-09-18T18:00:00+00:00")
         settings = SimpleNamespace(
             omnifocus_agent_enabled=True,
             omnifocus_agent_tag="🤖 Gladys",

@@ -1,13 +1,12 @@
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
+from ..localtime import get_tz
 from fastapi import APIRouter, HTTPException, Query
 
 from ..models.schemas import CalendarEvent
 from ..services import fantastical
 
 router = APIRouter(prefix="/api/calendar", tags=["calendar"])
-TZ = ZoneInfo("Asia/Bangkok")
 
 
 @router.get("/today", response_model=list[CalendarEvent])
@@ -25,12 +24,12 @@ async def calendar_range(
 ) -> list[CalendarEvent]:
     try:
         start = (
-            datetime.fromisoformat(from_).astimezone(TZ)
+            datetime.fromisoformat(from_).astimezone(get_tz())
             if from_
-            else datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+            else datetime.now(get_tz()).replace(hour=0, minute=0, second=0, microsecond=0)
         )
         end = (
-            datetime.fromisoformat(to).astimezone(TZ)
+            datetime.fromisoformat(to).astimezone(get_tz())
             if to
             else start + timedelta(days=1)
         )

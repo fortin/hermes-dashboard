@@ -50,7 +50,7 @@ class GetTaggedTasksTests(unittest.IsolatedAsyncioTestCase):
                 "items": [
                     {
                         "id": "t1",
-                        "name": "Add Nubiani",
+                        "name": "Add Harbor Cafe",
                         "note": "https://example.com",
                         "tags": [{"id": "g", "name": "🤖 Gladys"}],
                         "projectId": "p1",
@@ -83,7 +83,7 @@ class NormalizeTaskProjectTests(unittest.TestCase):
         task = omnifocus._normalize_task(
             {
                 "id": "t1",
-                "name": "Add Nubiani",
+                "name": "Add Harbor Cafe",
                 "projectId": "p1",
                 "projectName": "Places",
             }
@@ -123,7 +123,7 @@ class AddTaskTests(unittest.IsolatedAsyncioTestCase):
             omnifocus, "_call", new=AsyncMock(return_value={"ok": True})
         ) as call:
             await omnifocus.add_task(
-                "Review: Add Nubiani",
+                "Review: Add Harbor Cafe",
                 note="obsidian://adv-uri?vault=x",
                 tags=["🔎 Review"],
                 project_id="p1",
@@ -132,7 +132,7 @@ class AddTaskTests(unittest.IsolatedAsyncioTestCase):
         call.assert_awaited_once_with(
             "add_task",
             {
-                "name": "Review: Add Nubiani",
+                "name": "Review: Add Harbor Cafe",
                 "note": "obsidian://adv-uri?vault=x",
                 "tags": ["🔎 Review"],
                 "project_id": "p1",

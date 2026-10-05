@@ -81,6 +81,12 @@ export interface DataviewResolveResponse {
   approximate: boolean
 }
 
+export interface TimezonePreference {
+  timezone: string
+  source: string
+  options: string[]
+}
+
 export class ApiError extends Error {
   status: number
   body: unknown
@@ -170,5 +176,11 @@ export const api = {
     request<DataviewResolveResponse>('/api/dataview/resolve', {
       method: 'POST',
       body: JSON.stringify({ query, note_content }),
+    }),
+  getTimezone: () => request<TimezonePreference>('/api/preferences/timezone'),
+  setTimezone: (timezone: string | null) =>
+    request<TimezonePreference>('/api/preferences/timezone', {
+      method: 'PUT',
+      body: JSON.stringify({ timezone }),
     }),
 }

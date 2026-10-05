@@ -12,15 +12,14 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import httpx
 
-from ..config import get_settings
+from ..config import ROOT, get_settings
+from ..localtime import get_tz, timezone_name
 from ..models.schemas import AgentReply, Briefing, markdown_paragraphs, strip_leading_date
 
 logger = logging.getLogger(__name__)
-TZ = ZoneInfo("Asia/Bangkok")
 
 # Share one Hermes run at a time from this dashboard process so we don't
 # exhaust gateway.max_concurrent_runs alongside other Hermes clients.
@@ -40,6 +39,10 @@ _DAY_DONE_HOUR = 17
 _NEXTDAY_KIND = "perspective-v2"
 _APPLE_MODEL = "apple-intelligence"
 _APPLE_TIMEOUT_S = 180.0
+# Shortcuts posts a banner for every failed Use Model run. After that error,
+# skip the shortcut for a while instead of retrying briefing and each email.
+_APPLE_MODEL_COOLDOWN_S = 10 * 60
+_apple_model_down_until = 0.0
 # On-device Use Model shares a 4096-token window with the reply.
 # A 2549-character briefing prompt was rejected; ~2400 still answered.
 _APPLE_PROMPT_MAX = 2000
@@ -58,16 +61,22 @@ _FAILED_REPLY_MARKERS = (
 # separate read timeout so overnight OmniFocus jobs are not cut at 30 minutes.
 _HERMES_TIMEOUT = httpx.Timeout(connect=15.0, read=900.0, write=30.0, pool=15.0)
 _TRANSIENT_HTTP = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
-_DELEGATED_SYSTEM = (
-    "You are Gladys, Antonio's Hermes agent. He assigned you an OmniFocus task "
-    "to execute in the background. Use your tools and do the work. Do not "
-    "produce a daily briefing or tell him what he should do next.\n"
-    "If the work should run later or repeat, schedule it with the cronjob tool "
-    "(deliver='telegram' so results reach him). Then STATUS: done.\n"
-    "When finished, write a short receipt: what changed, where artifacts live, "
-    "and commit hashes if any. End with exactly one line: STATUS: done, "
-    "STATUS: blocked, or STATUS: failed. If blocked, say what you need from him."
-)
+
+
+def _delegated_system() -> str:
+    settings = get_settings()
+    owner = (getattr(settings, "owner_name", None) or "you").strip() or "you"
+    agent = (getattr(settings, "agent_name", None) or "Gladys").strip() or "Gladys"
+    return (
+        f"You are {agent}, {owner}'s Hermes agent. They assigned you an OmniFocus "
+        "task to execute in the background. Use your tools and do the work. Do not "
+        "produce a daily briefing or tell them what they should do next.\n"
+        "If the work should run later or repeat, schedule it with the cronjob tool "
+        "(deliver='telegram' so results reach them). Then STATUS: done.\n"
+        "When finished, write a short receipt: what changed, where artifacts live, "
+        "and commit hashes if any. End with exactly one line: STATUS: done, "
+        "STATUS: blocked, or STATUS: failed. If blocked, say what you need from them."
+    )
 
 
 class HermesUnavailable(Exception):
@@ -89,7 +98,8 @@ def describe_http_error(exc: BaseException) -> str:
 
 
 def local_now_context() -> dict[str, Any]:
-    now = datetime.now(TZ)
+    tz = get_tz()
+    now = datetime.now(tz)
     hour = now.hour
     if hour < 12:
         period = "morning"
@@ -99,12 +109,11 @@ def local_now_context() -> dict[str, Any]:
         period = "evening"
     else:
         period = "night"
-    # Next Friday is the earliest Shabbat could start this week —
-    # provided so the model cannot invent "Shabbat tonight" on a weekday.
+    # Next Friday is available for optional local rules (e.g. hermes-rules.local).
     days_until_friday = (4 - now.weekday()) % 7
     next_friday = (now + timedelta(days=days_until_friday)).date()
     return {
-        "timezone": "Asia/Bangkok",
+        "timezone": timezone_name(),
         "iso": now.isoformat(timespec="minutes"),
         "date": now.strftime("%Y-%m-%d"),
         "weekday": now.strftime("%A"),
@@ -121,13 +130,14 @@ def local_now_context() -> dict[str, Any]:
 def _parse_local(dt: str | None) -> datetime | None:
     if not dt:
         return None
+    tz = get_tz()
     try:
         parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=TZ)
-    return parsed.astimezone(TZ)
+        return parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
 
 
 def _clock_from_now(now: dict[str, Any]) -> datetime:
@@ -136,7 +146,7 @@ def _clock_from_now(now: dict[str, Any]) -> datetime:
         parsed = _parse_local(iso)
         if parsed is not None:
             return parsed
-    return datetime.now(TZ)
+    return datetime.now(get_tz())
 
 
 def _local_on_date(
@@ -159,7 +169,7 @@ def _local_on_date(
         day,
         int(match.group(1)),
         int(match.group(2)),
-        tzinfo=clock.tzinfo or TZ,
+        tzinfo=clock.tzinfo or get_tz(),
     )
 
 
@@ -239,14 +249,16 @@ def look_ahead_tomorrow(
     tasks: list[Any],
     now: dict[str, Any],
 ) -> bool:
-    """Preview tomorrow once today's timed events and On Deck are both finished.
+    """Preview tomorrow only when On Deck is empty and today's day is done.
 
-    Evening with nothing left on the clock still looks ahead even if On Deck
-    has tasks, matching the previous Hermes horizon.
+    Named On Deck tasks always keep the briefing on today — even after
+    `_DAY_DONE_HOUR` — so remaining work still gets a same-day recommendation.
     """
+    if _has_named_tasks(tasks):
+        return False
     if day_is_done(calendar, now):
         return True
-    return not _timed_events_remain(calendar, now) and not _has_named_tasks(tasks)
+    return not _timed_events_remain(calendar, now)
 
 
 _IGNORED_HOLIDAY_CALENDARS = frozenset(
@@ -328,25 +340,62 @@ def enrich_calendar_for_prompt(events: list[dict[str, Any]]) -> list[dict[str, A
     return enriched
 
 
+class _FormatMap(dict):
+    """Leave unknown placeholders intact when formatting local rules."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def _rules_file_path() -> Path:
+    raw = Path(
+        getattr(get_settings(), "hermes_rules_path", None) or "hermes-rules.local"
+    )
+    if raw.is_absolute():
+        return raw
+    return ROOT / raw
+
+
+def _load_extra_rules(now: dict[str, Any]) -> str:
+    path = _rules_file_path()
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not read Hermes rules file %s: %s", path, exc)
+        return ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        lines.append(line)
+    body = "\n".join(lines).strip()
+    if not body:
+        return ""
+    try:
+        return body.format_map(_FormatMap({k: str(v) for k, v in now.items()}))
+    except (ValueError, KeyError) as exc:
+        logger.warning("Hermes rules placeholders failed (%s); using raw text", exc)
+        return body
+
+
 def _datetime_rules(now: dict[str, Any]) -> str:
-    return (
+    base = (
         f"AUTHORITATIVE CLOCK: today is {now['weekday']} {now['date']}, "
         f"local time {now['human']} ({now['timezone']}), "
         f"time of day = {now['time_of_day']}. "
-        f"Shabbat for this locale next begins on Friday {now['next_shabbat_starts_on']} "
-        f"(sunset Friday → dusk Saturday). "
-        f"is_shabbat={now['is_shabbat']}. "
-        "Rules you MUST follow:\n"
-        "1. Do not invent weekday, date, or religious timing. Never say Shabbat is "
-        "starting tonight unless is_shabbat is true or the clock is Friday evening.\n"
-        "2. Holiday calendars are omitted from the snapshot (Jewish, Thai, UK, Swiss, "
-        "Spanish, and generic public holidays). Do not mention those holidays, fasts, "
-        "or observances, and do not treat them as Shabbat.\n"
-        "3. Only mention calendar events listed in the snapshot, with their listed "
-        "weekday and times. Do not add holidays or candle-lighting times that are "
-        "not listed.\n"
-        "4. Match tone to the actual time_of_day; never write a morning briefing at night."
+        "Do not invent weekday or date. "
+        "Only mention calendar events listed in the snapshot, with their listed "
+        "weekday and times. "
+        "Match tone to the actual time_of_day; never write a morning briefing "
+        "at the wrong time of day."
     )
+    extra = _load_extra_rules(now)
+    if extra:
+        return f"{base}\n\n{extra}"
+    return base
 
 
 def hermes_busy() -> bool:
@@ -367,7 +416,7 @@ async def execute_delegated_task(message: str) -> AgentReply:
         message,
         include_snapshot=False,
         max_attempts=2,
-        system=f"{_DELEGATED_SYSTEM}\n\n{_datetime_rules(now)}",
+        system=f"{_delegated_system()}\n\n{_datetime_rules(now)}",
         timeout=delegated_task_timeout(),
     )
 
@@ -391,8 +440,9 @@ async def ask_hermes(
     snapshot["now"] = now
 
     if system is None:
+        owner = (getattr(settings, "owner_name", None) or "you").strip() or "you"
         system = (
-            "You are Hermes embedded in Antonio's local day dashboard. "
+            f"You are Hermes embedded in {owner}'s local day dashboard. "
             "Prefer concrete, actionable advice. Keep replies concise unless asked "
             "for detail.\n\n"
             f"{_datetime_rules(now)}\n"
@@ -502,6 +552,21 @@ def siri_binary() -> Path:
     return Path.home() / ".local" / "bin" / "siri"
 
 
+def _apple_model_error(detail: str) -> bool:
+    return "error occurred when running the model" in (detail or "").lower()
+
+
+def _note_apple_model_outage(detail: str) -> None:
+    global _apple_model_down_until
+    if not _apple_model_error(detail):
+        return
+    _apple_model_down_until = time.monotonic() + _APPLE_MODEL_COOLDOWN_S
+    logger.warning(
+        "Apple Intelligence model failed; not calling the shortcut again for %ss",
+        int(_APPLE_MODEL_COOLDOWN_S),
+    )
+
+
 def _kill_apple_process(proc: asyncio.subprocess.Process) -> None:
     """Stop siri and the Shortcuts child. Killing the shell alone leaves the request open."""
     if proc.returncode is not None or proc.pid is None:
@@ -524,6 +589,8 @@ async def _ask_apple_unlocked(message: str, *, timeout: float) -> AgentReply:
     prompt = (message or "").strip()
     if not prompt:
         raise HermesUnavailable("Apple Intelligence prompt was empty")
+    if time.monotonic() < _apple_model_down_until:
+        raise HermesUnavailable("Apple Intelligence cooling down after a model error")
     binary = siri_binary()
     env = os.environ.copy()
     env["SIRI_RENDER"] = "0"
@@ -556,6 +623,7 @@ async def _ask_apple_unlocked(message: str, *, timeout: float) -> AgentReply:
     err = stderr.decode("utf-8", errors="replace").strip()
     if proc.returncode != 0 or not text:
         detail = err or text or f"exit {proc.returncode}"
+        _note_apple_model_outage(detail)
         raise HermesUnavailable(f"Apple Intelligence failed: {detail[:500]}")
     if is_failed_model_reply(text):
         raise HermesUnavailable(text[:400] or "empty Apple Intelligence reply")
@@ -810,7 +878,8 @@ def apple_briefing_prompt(
         )
         cover = (
             "Name the first timed commitment and the single best morning task "
-            "(note due/defer/planned if shown, say why it fits). Mention at most "
+            "(note due/defer/planned if shown, say why it fits). Copy listed "
+            "clock times exactly; do not convert timezones. Mention at most "
             f"{_MAX_NAMED_TASKS} tasks total; leave the rest unmentioned."
         )
     else:
@@ -829,7 +898,8 @@ def apple_briefing_prompt(
         cover = (
             "Briefly place free blocks against timed commitments, then recommend "
             "the highest-value On Deck task that still fits before the next "
-            "commitment (name it, note due/defer/planned, say why). Add at most "
+            "commitment (name it, note due/defer/planned, say why). Copy listed "
+            "clock times exactly; do not convert timezones. Add at most "
             f"{_MAX_NAMED_TASKS - 1} more named tasks only if they fit the same "
             "window; leave everything else unmentioned."
         )
@@ -1267,16 +1337,37 @@ def _nextday_for(date: str) -> Briefing | None:
     return _usable_briefing(_nextday_cache[1], allow_tomorrow=True)
 
 
+def _invalidate_nextday() -> None:
+    """Drop a held tomorrow plan (memory + disk).
+
+    On Deck work must not keep losing to an earlier empty-deck tomorrow
+    preview — including SSE peek, which cannot re-query OmniFocus.
+    """
+    global _nextday_cache, _hydrated_nextday
+    _nextday_cache = None
+    _hydrated_nextday = True
+    path = nextday_path()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Failed to clear next-day briefing")
+
+
 def peek_briefing() -> Briefing | None:
     """Return a cached briefing without touching Fantastical or OmniFocus."""
     now = local_now_context()
     held = _nextday_for(str(now.get("date") or ""))
     if held is not None:
         return held
-    if int(now.get("hour") or 0) >= _DAY_DONE_HOUR:
-        return None
     fresh = _fresh_cached_briefing(force=False)
     if fresh is not None:
+        # After day-done, only surface a today briefing that is still within
+        # TTL (just regenerated because On Deck still has work). Otherwise
+        # leave the slot empty so Safari does not flash a morning plan.
+        if int(now.get("hour") or 0) >= _DAY_DONE_HOUR:
+            cached_at = _briefing_cache[0] if _briefing_cache is not None else 0.0
+            if time.monotonic() - cached_at >= _BRIEFING_TTL_S:
+                return None
         return fresh
     if hermes_busy():
         return _last_good_briefing()
@@ -1287,10 +1378,15 @@ def _served_cache(context: dict[str, Any], now: dict[str, Any]) -> Briefing | No
     calendar = enrich_calendar_for_prompt(
         [e for e in (context.get("calendar") or []) if isinstance(e, dict)]
     )
+    tasks = [t for t in (context.get("tasks") or []) if isinstance(t, dict)]
     held = _nextday_for(str(now.get("date") or ""))
+    # A held tomorrow plan is only valid while On Deck stays empty. New tasks
+    # (or Refresh after adding some) must fall through to today's briefing.
+    if held is not None and _has_named_tasks(tasks):
+        _invalidate_nextday()
+        held = None
     if held is not None:
         return held
-    tasks = [t for t in (context.get("tasks") or []) if isinstance(t, dict)]
     if look_ahead_tomorrow(calendar, tasks, now):
         return None
     open_cal = omit_finished_events(calendar, _clock_from_now(now))
@@ -1437,6 +1533,9 @@ def _remember_briefing(
     if plan_tomorrow:
         _save_nextday(today, briefing)
     else:
+        # Today won (On Deck still active, or morning). Drop any held
+        # tomorrow so SSE peek cannot overwrite the dashboard again.
+        _invalidate_nextday()
         _save_last_good(briefing)
     _spawn_publish(briefing)
     return briefing
@@ -1462,7 +1561,7 @@ def _calendar_unavailable_briefing() -> Briefing:
         return last
     return Briefing(
         summary="The calendar couldn't be loaded, so this briefing was held back.",
-        generated_at=datetime.now(TZ).isoformat(),
+        generated_at=datetime.now(get_tz()).isoformat(),
         source="fallback",
     )
 
@@ -1526,6 +1625,66 @@ _CLOCK_TIME = re.compile(r"\b\d{1,2}:\d{2}\b")
 def _mentions_listed_task(text: str, task_names: list[str]) -> bool:
     lowered = text.casefold()
     return any(name.casefold() in lowered for name in task_names if name.strip())
+
+
+def _norm_hhmm(value: str) -> str:
+    match = _CLOCK_TIME.search(value or "")
+    if not match:
+        return ""
+    hour, minute = match.group(0).split(":")
+    return f"{int(hour):02d}:{int(minute):02d}"
+
+
+def _clock_distance(left: str, right: str) -> int:
+    left_mins = int(left[:2]) * 60 + int(left[3:])
+    right_mins = int(right[:2]) * 60 + int(right[3:])
+    diff = abs(left_mins - right_mins)
+    return min(diff, 24 * 60 - diff)
+
+
+def _event_start_times(events: list[dict[str, Any]]) -> list[tuple[str, set[str]]]:
+    grouped: dict[str, set[str]] = {}
+    order: list[str] = []
+    for event in events:
+        title = str(event.get("title") or "").strip()
+        start = _norm_hhmm(str(event.get("start_local") or ""))
+        if (
+            not title
+            or not start
+            or event.get("all_day")
+            or event.get("start_local") == "all day"
+        ):
+            continue
+        key = title.casefold()
+        if key not in grouped:
+            grouped[key] = set()
+            order.append(title)
+        grouped[key].add(start)
+    return [(title, grouped[title.casefold()]) for title in order]
+
+
+def correct_event_clocks(summary: str, events: list[dict[str, Any]]) -> str:
+    """Put an event's listed local start back when the prose converts the time."""
+    titled = _event_start_times(events)
+    if not titled or not summary:
+        return summary
+    text = summary
+    for title, starts in titled:
+        pattern = re.compile(
+            rf"({re.escape(title)})(?P<gap>.{{0,40}}?\b(?:at|from|around)\s+)"
+            rf"(?P<time>\d{{1,2}}:\d{{2}})",
+            re.IGNORECASE,
+        )
+
+        def repl(match: re.Match[str], starts: set[str] = starts) -> str:
+            found = _norm_hhmm(match.group("time"))
+            if not found or found in starts:
+                return match.group(0)
+            target = min(starts, key=lambda item: _clock_distance(found, item))
+            return f"{match.group(1)}{match.group('gap')}{target}"
+
+        text = pattern.sub(repl, text)
+    return text
 
 
 def _allowed_clock_times(
@@ -1663,16 +1822,18 @@ def _briefing_prompt(
     tomorrow_body = json.dumps(tomorrow_cal or [], default=str) if tomorrow_cal else "(none)"
     listed_only = (
         "Do not mention an event, task, or clock time that is not listed above. "
+        "Clock times are already local wall times. Do not convert timezones. "
         "Events that have already ended are omitted. "
     )
     layout = _BRIEFING_LAYOUT if has_tasks else _BRIEFING_LAYOUT_EMPTY
+    owner = (getattr(get_settings(), "owner_name", None) or "you").strip() or "you"
     if has_tasks:
         json_shape = (
             "Return ONLY JSON with this shape:\n"
             '{"summary":"markdown prose in short paragraphs; escape newlines as \\n",'
             '"suggested_task_ids":["id"]}\n'
             "suggested_task_ids must be 1-3 ids copied exactly from the task "
-            "list above, in the order Antonio should do them next. Use [] if none. "
+            f"list above, in the order {owner} should do them next. Use [] if none. "
             "Do not invent ids."
         )
     else:
@@ -1698,12 +1859,11 @@ def _briefing_prompt(
             f"Today's calendar (authoritative):\n{calendar_body}\n\n"
             f"On Deck tasks (use these ids, do not invent):\n{listed}\n\n"
             "Produce a short briefing for the next few hours from NOW — not a "
-            "generic morning briefing and not a Friday/Shabbat briefing unless "
-            "today really is Friday evening or Saturday. "
+            "generic morning briefing unless it is actually morning. "
             f"{cover}"
             f"{listed_only}"
-            "Do not mention Shabbat, candle lighting, or breaking a fast unless "
-            "those times appear explicitly in the calendar list above for today.\n\n"
+            "Do not mention holidays or religious observances unless they appear "
+            "explicitly in the calendar list above for today.\n\n"
             f"{layout}\n\n"
             f"{json_shape}"
         )
@@ -1733,8 +1893,8 @@ def _briefing_prompt(
         f"{cover}"
         f"{listed_only}"
         "Name tomorrow's weekday. Do not say those events "
-        "are today. Do not mention Shabbat, candle lighting, or breaking a fast "
-        "unless those times appear explicitly in tomorrow's calendar list.\n\n"
+        "are today. Do not mention holidays or religious observances unless they "
+        "appear explicitly in tomorrow's calendar list.\n\n"
         f"{layout}\n\n"
         f"{json_shape}"
     )
@@ -1761,6 +1921,8 @@ async def _generate_briefing_locked(
     )
     tasks = [t for t in (context.get("tasks") or []) if isinstance(t, dict)]
     plan_tomorrow = look_ahead_tomorrow(cal, tasks, now)
+    if not plan_tomorrow and _has_named_tasks(tasks):
+        _invalidate_nextday()
     tomorrow = _tomorrow_label(now) if plan_tomorrow else None
     tomorrow_cal: list[dict[str, Any]] | None = None
     if plan_tomorrow:
@@ -1836,6 +1998,7 @@ async def _generate_briefing_locked(
             task_names,
             _allowed_clock_times(listed_events, task_rows),
         )
+        summary = correct_event_clocks(summary, listed_events)
         source = "apple" if reply.model == _APPLE_MODEL else "hermes"
         if not summary:
             summary = _factual_briefing(listed_events, task_rows, tomorrow=plan_tomorrow)
@@ -1855,7 +2018,7 @@ async def _generate_briefing_locked(
         return _remember_briefing(
             Briefing(
                 summary=summary,
-                generated_at=datetime.now(TZ).isoformat(),
+                generated_at=datetime.now(get_tz()).isoformat(),
                 source=source,
                 suggested_task_ids=suggested,
                 horizon="tomorrow" if plan_tomorrow else "today",
@@ -1879,7 +2042,7 @@ async def _generate_briefing_locked(
             logger.warning("Briefing Hermes failed (%s); not substituting today's briefing", exc)
             return Briefing(
                 summary=_briefing_failure_summary(exc),
-                generated_at=datetime.now(TZ).isoformat(),
+                generated_at=datetime.now(get_tz()).isoformat(),
                 source="fallback",
                 suggested_task_ids=[str(tasks[0]["id"])] if tasks and tasks[0].get("id") else [],
             )
@@ -1900,7 +2063,7 @@ async def _generate_briefing_locked(
 
         return Briefing(
             summary=_briefing_failure_summary(exc),
-            generated_at=datetime.now(TZ).isoformat(),
+            generated_at=datetime.now(get_tz()).isoformat(),
             source="fallback",
             suggested_task_ids=[str(tasks[0]["id"])] if tasks and tasks[0].get("id") else [],
         )

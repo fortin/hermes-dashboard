@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from ..config import get_settings
+from ..localtime import get_tz
 
 logger = logging.getLogger(__name__)
-TZ = ZoneInfo("Asia/Bangkok")
 
-VAULT_ROOT = Path("/Users/antonio/Obsidian/My Vault")
+
+def _vault_root() -> Path | None:
+    raw = (get_settings().obsidian_vault_path or "").strip()
+    if not raw:
+        return None
+    return Path(raw)
 
 
 def _completed_tasks_from_note(content: str) -> list[str]:
@@ -28,14 +31,15 @@ def _completed_tasks_from_note(content: str) -> list[str]:
 
 def _files_touched_today(*, created: bool, limit: int = 40) -> list[str]:
     """Best-effort filesystem scan for notes touched today (vault-relative paths)."""
-    if not VAULT_ROOT.exists():
+    vault = _vault_root()
+    if vault is None or not vault.exists():
         return []
-    start = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = datetime.now(get_tz()).replace(hour=0, minute=0, second=0, microsecond=0)
     start_ts = start.timestamp()
     hits: list[tuple[float, str]] = []
     skip_parts = {".obsidian", ".trash", "node_modules", ".git"}
     try:
-        for path in VAULT_ROOT.rglob("*.md"):
+        for path in vault.rglob("*.md"):
             if any(part in skip_parts for part in path.parts):
                 continue
             try:
@@ -44,7 +48,7 @@ def _files_touched_today(*, created: bool, limit: int = 40) -> list[str]:
                 continue
             stamp = st.st_ctime if created else st.st_mtime
             if stamp >= start_ts:
-                rel = str(path.relative_to(VAULT_ROOT))
+                rel = str(path.relative_to(vault))
                 hits.append((stamp, rel))
     except OSError as exc:
         logger.warning("Vault scan failed: %s", exc)

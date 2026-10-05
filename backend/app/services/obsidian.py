@@ -4,14 +4,12 @@ import hashlib
 import re
 from datetime import date, datetime
 from typing import Any
-from zoneinfo import ZoneInfo
-from zoneinfo import ZoneInfo as _ZoneInfo  # noqa: F401 — keep import clear
 
+from ..localtime import get_tz
 from ..config import Settings, get_settings
 from ..mcp.client import registry
 from ..models.schemas import DailyNote, DailyNoteSection
 
-TZ = ZoneInfo("Asia/Bangkok")
 
 SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 
@@ -29,7 +27,7 @@ async def _client(settings: Settings):
 
 def daily_note_path(day: date | None = None, settings: Settings | None = None) -> str:
     settings = settings or get_settings()
-    day = day or datetime.now(TZ).date()
+    day = day or datetime.now(get_tz()).date()
     # Format token D-YYYY-MM-DD → D-2026-09-13
     name = settings.obsidian_daily_format
     name = name.replace("YYYY", f"{day.year:04d}")
@@ -71,7 +69,7 @@ def _ordinal(n: int) -> str:
 
 def instantiate_template(template: str, day: date) -> str:
     """Replace Templater tokens used in the Daily Template (best-effort)."""
-    dt = datetime(day.year, day.month, day.day, tzinfo=TZ)
+    dt = datetime(day.year, day.month, day.day, tzinfo=get_tz())
     iso_week = dt.isocalendar()
     week = f"{iso_week.year}-W{iso_week.week:02d}"
     month = f"{day.year:04d}-{day.month:02d}"
@@ -87,7 +85,7 @@ def instantiate_template(template: str, day: date) -> str:
             f"{(day.month - 1) // 3 + 1} {day.year}"
         ),
         '<% tp.date.now("dddd, MMMM Do YYYY") %>': title,
-        '<% tp.date.now("HH:mm") %>': datetime.now(TZ).strftime("%H:%M"),
+        '<% tp.date.now("HH:mm") %>': datetime.now(get_tz()).strftime("%H:%M"),
         "<%tp.web.daily_quote() %>": "_Add a quote that resonates today._",
     }
     out = template
@@ -170,7 +168,7 @@ async def write_vault_note(path: str, content: str) -> None:
 
 async def get_today_note(create: bool = True) -> DailyNote:
     settings = get_settings()
-    day = datetime.now(TZ).date()
+    day = datetime.now(get_tz()).date()
     path = daily_note_path(day, settings)
     existing = await _read_path(path)
     created = False
@@ -209,7 +207,7 @@ async def get_today_note(create: bool = True) -> DailyNote:
 
 async def update_today_note(content: str, revision: str) -> DailyNote:
     settings = get_settings()
-    day = datetime.now(TZ).date()
+    day = datetime.now(get_tz()).date()
     path = daily_note_path(day, settings)
     current = await _read_path(path)
     if current is None:

@@ -21,7 +21,7 @@ def _settings(**overrides):
 
 def _now(**overrides):
     data = {
-        "timezone": "Asia/Bangkok",
+        "timezone": "UTC",
         "date": "2026-09-17",
         "weekday": "Thursday",
         "time_of_day": "morning",
@@ -33,7 +33,7 @@ def _now(**overrides):
 
 def _briefing(**overrides) -> Briefing:
     data = dict(
-        summary="Focus on the Kikodo proposal before lunch.",
+        summary="Focus on the quarterly proposal before lunch.",
         generated_at="2026-09-17T08:05:00+07:00",
         source="hermes",
         suggested_task_ids=["bbb"],
@@ -65,15 +65,15 @@ class FingerprintTests(unittest.TestCase):
     def test_same_after_markdown(self):
         self.assertTrue(
             briefing_push.substantively_same(
-                "Focus on the Kikodo proposal before lunch.",
-                "**Focus on the Kikodo proposal before lunch.**",
+                "Focus on the quarterly proposal before lunch.",
+                "**Focus on the quarterly proposal before lunch.**",
             )
         )
 
     def test_different_task_is_substantive(self):
         self.assertFalse(
             briefing_push.substantively_same(
-                "Focus on the Kikodo proposal before lunch.",
+                "Focus on the quarterly proposal before lunch.",
                 "Then file expenses.",
             )
         )
@@ -192,7 +192,7 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
         ):
             first = await briefing_push.publish_briefing(_briefing())
             second = await briefing_push.publish_briefing(
-                _briefing(summary="**Focus on the Kikodo proposal before lunch.**")
+                _briefing(summary="**Focus on the quarterly proposal before lunch.**")
             )
         self.assertTrue(first)
         self.assertTrue(second)
@@ -226,14 +226,14 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
         ):
             await briefing_push.publish_briefing(
                 _briefing(
-                    summary="Focus on the Kikodo proposal before lunch.",
+                    summary="Focus on the quarterly proposal before lunch.",
                     context_fingerprint="abc123",
                     source="apple",
                 )
             )
             await briefing_push.publish_briefing(
                 _briefing(
-                    summary="Focus on the Kikodo proposal before lunch.",
+                    summary="Focus on the quarterly proposal before lunch.",
                     context_fingerprint="def456",
                     source="apple",
                 )
@@ -248,7 +248,7 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
         ):
             await briefing_push.publish_briefing(_briefing())
             await briefing_push.publish_briefing(
-                _briefing(summary="Before lunch, focus on the Kikodo proposal.")
+                _briefing(summary="Before lunch, focus on the quarterly proposal.")
             )
         send.assert_awaited_once()
 
@@ -265,12 +265,12 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await briefing_push.publish_briefing(_briefing())
                 await briefing_push.publish_briefing(
-                    _briefing(summary="Focus on the Kikodo proposal before lunch.")
+                    _briefing(summary="Focus on the quarterly proposal before lunch.")
                 )
             send.assert_awaited_once()
             self.assertEqual(
                 note.read_text(encoding="utf-8"),
-                "Focus on the Kikodo proposal before lunch.\n",
+                "Focus on the quarterly proposal before lunch.\n",
             )
 
     async def test_sends_at_night(self):
@@ -338,7 +338,7 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
                 await briefing_push.publish_briefing(_briefing())
             self.assertEqual(
                 note.read_text(encoding="utf-8"),
-                "Focus on the Kikodo proposal before lunch.\n",
+                "Focus on the quarterly proposal before lunch.\n",
             )
 
     async def test_overwrites_note_on_each_update(self):
@@ -363,7 +363,7 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
             patch("app.services.hermes.peek_briefing", return_value=None),
             patch(
                 "app.services.briefing_push.briefing_context",
-                new=AsyncMock(return_value={"now": _now()}),
+                new=AsyncMock(return_value={"calendar": [], "tasks": []}),
             ),
             patch(
                 "app.services.hermes.generate_briefing",
@@ -380,6 +380,10 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "app.services.briefing_push.local_now_context",
                 return_value=_now(time_of_day="night", hour=22),
+            ),
+            patch(
+                "app.services.briefing_push.briefing_context",
+                new=AsyncMock(return_value={"calendar": [], "tasks": []}),
             ),
             patch("app.services.hermes.peek_briefing", return_value=_briefing(horizon="tomorrow")),
             patch(
@@ -400,11 +404,39 @@ class PublishBriefingTests(unittest.IsolatedAsyncioTestCase):
             patch("app.services.hermes.peek_briefing", return_value=None),
             patch(
                 "app.services.briefing_push.briefing_context",
-                new=AsyncMock(return_value={"now": _now(time_of_day="night", hour=22)}),
+                new=AsyncMock(return_value={"calendar": [], "tasks": []}),
             ),
             patch(
                 "app.services.hermes.generate_briefing",
                 new=AsyncMock(return_value=_briefing(horizon="tomorrow")),
+            ) as generate,
+        ):
+            await briefing_push.push_due_briefing()
+        generate.assert_awaited_once()
+
+    async def test_push_due_keeps_today_when_on_deck_has_tasks_after_17(self):
+        with (
+            patch("app.services.briefing_push.get_settings", return_value=_settings()),
+            patch(
+                "app.services.briefing_push.local_now_context",
+                return_value=_now(time_of_day="evening", hour=17, minute=15),
+            ),
+            patch(
+                "app.services.briefing_push.briefing_context",
+                new=AsyncMock(
+                    return_value={
+                        "calendar": [],
+                        "tasks": [{"id": "aaa", "name": "File expenses"}],
+                    }
+                ),
+            ),
+            patch(
+                "app.services.hermes.peek_briefing",
+                return_value=_briefing(horizon="tomorrow"),
+            ),
+            patch(
+                "app.services.hermes.generate_briefing",
+                new=AsyncMock(return_value=_briefing(horizon="today")),
             ) as generate,
         ):
             await briefing_push.push_due_briefing()

@@ -7,8 +7,8 @@ import re
 import time
 from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
+from ..localtime import get_tz
 from ..config import get_settings
 from ..models.schemas import EmailTriageItem, EmailTriageResponse
 from .hermes import HermesUnavailable, _APPLE_PROMPT_MAX, ask_apple, ask_hermes, hermes_busy
@@ -27,7 +27,6 @@ _APPLE_EMAIL_FOOTER = (
     "Draft a plain reply only when a human reply is warranted. Do not invent facts."
 )
 _triage_cache: tuple[float, EmailTriageResponse] | None = None
-TZ = ZoneInfo("Asia/Bangkok")
 
 
 async def _run(cmd: list[str], timeout: float = 45.0) -> tuple[int, str, str]:
@@ -242,7 +241,7 @@ async def _triage_via_apple(envelopes: list[dict[str, Any]]) -> EmailTriageRespo
     return EmailTriageResponse(
         items=_rank_items(items),
         source="apple",
-        generated_at=datetime.now(TZ).isoformat(),
+        generated_at=datetime.now(get_tz()).isoformat(),
     )
 
 
@@ -319,7 +318,7 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
             env["snippet"] = ""
 
     prompt = (
-        "Triage these messages for Antonio's day dashboard. "
+        f"Triage these messages for {(getattr(get_settings(), 'owner_name', None) or 'you')}'s day dashboard. "
         "They are already filtered to unread OR flagged only — do not ask for more mail. "
         "Ignore pure promotional/newsletter/noise unless action is required. "
         "Return ONLY JSON with shape:\n"
@@ -357,7 +356,7 @@ async def triage_inbox(force: bool = False) -> EmailTriageResponse:
         result = EmailTriageResponse(
             items=_rank_items(items),
             source="hermes",
-            generated_at=datetime.now(TZ).isoformat(),
+            generated_at=datetime.now(get_tz()).isoformat(),
         )
         _triage_cache = (time.monotonic(), result)
         return result

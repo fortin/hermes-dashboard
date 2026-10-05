@@ -5,15 +5,14 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+from ..localtime import get_tz
 from ..config import Settings, get_settings
 from ..mcp.client import registry
 from ..models.schemas import CalendarEvent
 
-TZ = ZoneInfo("Asia/Bangkok")
 _CAL_LOCK = asyncio.Lock()
 _TODAY_TTL_S = 60.0
 _CALENDARS_TTL_S = 10 * 60.0
@@ -23,8 +22,8 @@ _calendars_cache: tuple[float, dict[str, str]] | None = None
 
 def _local(dt: datetime) -> datetime:
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=TZ)
-    return dt.astimezone(TZ)
+        return dt.replace(tzinfo=get_tz())
+    return dt.astimezone(get_tz())
 
 
 def _day_phrase(dt: datetime) -> str:
@@ -36,7 +35,7 @@ def _parse_when(from_dt: datetime | None, to_dt: datetime | None) -> str:
     """Fantastical `when` is natural language, e.g. 'July 7 to July 10 2026'."""
     start = _local(
         from_dt
-        or datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        or datetime.now(get_tz()).replace(hour=0, minute=0, second=0, microsecond=0)
     )
     end = _local(to_dt or (start + timedelta(days=1)))
     last = end
@@ -134,13 +133,13 @@ def _normalize_event(
             start_dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
             end_dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
             if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=TZ)
+                start_dt = start_dt.replace(tzinfo=get_tz())
             if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=TZ)
+                end_dt = end_dt.replace(tzinfo=get_tz())
             if (
                 end_dt - start_dt >= timedelta(hours=20)
-                and start_dt.astimezone(TZ).hour == 0
-                and start_dt.astimezone(TZ).minute == 0
+                and start_dt.astimezone(get_tz()).hour == 0
+                and start_dt.astimezone(get_tz()).minute == 0
             ):
                 all_day = True
         except ValueError:
@@ -307,7 +306,7 @@ async def get_today() -> list[CalendarEvent]:
         cached_at, cached = _today_cache
         if time.monotonic() - cached_at < _TODAY_TTL_S:
             return cached
-    start, end = _local_day_bounds(datetime.now(TZ))
+    start, end = _local_day_bounds(datetime.now(get_tz()))
     # Fantastical wants a concrete date. The word "today" comes back empty
     # when the XPC session has just dropped, even though the day has events.
     events = await _query_when(_parse_when(start, end))
@@ -316,11 +315,11 @@ async def get_today() -> list[CalendarEvent]:
 
 
 async def get_tomorrow() -> list[CalendarEvent]:
-    start, end = _local_day_bounds(datetime.now(TZ) + timedelta(days=1))
+    start, end = _local_day_bounds(datetime.now(get_tz()) + timedelta(days=1))
     return await _query_when(_parse_when(start, end))
 
 
 async def get_upcoming(days: int = 7) -> list[CalendarEvent]:
-    start = datetime.now(TZ)
+    start = datetime.now(get_tz())
     end = start + timedelta(days=days)
     return await get_events(start, end)

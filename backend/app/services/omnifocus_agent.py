@@ -8,15 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
+from ..localtime import get_tz
 from ..config import get_settings
 from . import hermes, obsidian, omnifocus
 from .hermes import HermesUnavailable
 
 logger = logging.getLogger(__name__)
 
-TZ = ZoneInfo("Asia/Bangkok")
 LOG_DELIMITER = "━━━ GLADYS LOG ━━━"
 _STATUS_RE = re.compile(r"^STATUS:\s*(done|blocked|failed)\s*$", re.I | re.M)
 _STARTUP_DELAY_S = 60
@@ -60,8 +59,8 @@ def _parse_planned(value: str) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=TZ)
-    return parsed.astimezone(TZ)
+        return parsed.replace(tzinfo=get_tz())
+    return parsed.astimezone(get_tz())
 
 
 def planned_is_due(planned: str | None, now: datetime) -> bool:
@@ -146,7 +145,7 @@ def _task_row(task: Any, agent_tags: AgentTags) -> dict[str, Any]:
 async def peek_queue(*, now: datetime | None = None) -> dict[str, Any]:
     settings = get_settings()
     agent_tags = AgentTags.from_settings(settings)
-    clock = now or datetime.now(TZ)
+    clock = now or datetime.now(get_tz())
     snapshot: dict[str, Any] = {
         "enabled": bool(getattr(settings, "omnifocus_agent_enabled", False)),
         "tag": agent_tags.assign,
@@ -384,7 +383,7 @@ async def tick(*, now: datetime | None = None) -> dict[str, str] | None:
         logger.warning("Skipping Gladys pickup; Hermes is busy")
         return None
     agent_tags = AgentTags.from_settings(settings)
-    clock = now or datetime.now(TZ)
+    clock = now or datetime.now(get_tz())
     tasks = await omnifocus.get_tagged_tasks(agent_tags.assign)
     picked = pick_eligible(tasks, agent_tags, clock)
     ready = eligible_tasks(tasks, agent_tags, clock)

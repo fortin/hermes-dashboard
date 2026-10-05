@@ -9,14 +9,16 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
 from .db import init_db
+from .localtime import load_timezone_preference
 from .mcp.client import registry
-from .routers import agent, calendar, daily_note, email, tasks, widgets
+from .routers import agent, calendar, daily_note, email, preferences, tasks, widgets
 from .services import briefing_push, omnifocus_agent
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await init_db()
+    await load_timezone_preference()
     push_task = asyncio.create_task(briefing_push.run_loop())
     gladys_task = asyncio.create_task(omnifocus_agent.run_loop())
     try:
@@ -52,6 +54,7 @@ app.include_router(daily_note.router)
 app.include_router(agent.router)
 app.include_router(email.router)
 app.include_router(widgets.router)
+app.include_router(preferences.router)
 
 DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
