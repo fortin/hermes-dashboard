@@ -17,8 +17,15 @@ The dashboard is a single-page layout, not a multi-route app.
 | **Quick Status** | OmniFocus inbox / overdue / flagged / On Deck counts. |
 | **Today** | Fantastical events for the current day. Click an event to open it in Fantastical. |
 | **On Deck** | The OmniFocus “On Deck” perspective. Complete with a 5-second undo, add a task, and pin items Hermes suggested in the briefing. |
+| **Timezone** | Muted header dropdown under the date. On first visit (when no preference is stored), the UI detects the browser IANA zone and saves it. Override anytime; calendar, briefings, and “is the day done?” logic follow the active zone. |
 
-Times and “is the day done?” logic use **Asia/Bangkok**.
+### Timezone resolution
+
+Precedence: **Postgres preference** (set from the UI) → **`DASHBOARD_TIMEZONE` in `.env`** → **host IANA** → **UTC**. Leave `DASHBOARD_TIMEZONE` empty if you want browser auto-detect on first load.
+
+### Apple Intelligence (optional)
+
+When `APPLE_INTELLIGENCE=true`, briefing generation, Ask Hermes, and email triage prefer the macOS `siri` CLI (`SIRI_BIN`, then `~/.local/bin/siri`) with shortcut `SIRI_SHORTCUT`. Hermes on the gateway is the fallback if the shortcut fails or is disabled.
 
 ### Briefing publish (optional)
 
@@ -97,7 +104,7 @@ cd hermes-dashboard
 cp .env.example .env
 ```
 
-Edit `.env` so every path, token, and URL matches **this machine**. Defaults in `backend/app/config.py` and `.env.example` are personal (vault folders, MCP binaries, Postgres user).
+Edit `.env` so every path, token, and URL matches **this machine**. Copy `hermes-rules.local.example` to `hermes-rules.local` if you want custom clock / calendar prompt rules (gitignored).
 
 ### Backend
 
@@ -124,7 +131,7 @@ npm install
 npm run build    # writes frontend/dist for the FastAPI static server
 ```
 
-Or use `scripts/build-frontend.sh` from the repo root.
+Or use `scripts/build-frontend.sh` from the repo root. See [`frontend/README.md`](frontend/README.md) for UI development (Vite proxy, components, TanStack Query).
 
 ## Run
 
@@ -165,10 +172,17 @@ Loaded from the repo-root `.env` via pydantic-settings. The dashboard binds **lo
 | Variable | Purpose |
 | --- | --- |
 | `DASHBOARD_HOST` / `DASHBOARD_PORT` | Bind address (default `127.0.0.1:8787`) |
-| `DATABASE_URL` | SQLAlchemy async URL (`postgresql+asyncpg://…`) |
+| `DATABASE_URL` | SQLAlchemy async URL (`postgresql+asyncpg://…`); set in `.env` |
+| `OWNER_NAME` | Name used in Hermes / Apple Intelligence prompts (default `you`) |
+| `AGENT_NAME` | Background agent name in delegated-task prompts (default `Gladys`) |
+| `DASHBOARD_TIMEZONE` | Optional IANA fallback when no UI preference is stored |
+| `HERMES_RULES_PATH` | Optional local rules file (default `hermes-rules.local`) |
 | `HERMES_BASE_URL` | OpenAI-compatible base, including `/v1` |
 | `HERMES_API_KEY` / `HERMES_MODEL` | Gateway auth and model name |
+| `APPLE_INTELLIGENCE` | Use `siri` for briefing / ask / email triage (default true) |
+| `SIRI_BIN` / `SIRI_SHORTCUT` | Siri CLI path and Shortcuts name |
 | `OBSIDIAN_MCP_URL` / `OBSIDIAN_MCP_TOKEN` | Streamable HTTP MCP |
+| `OBSIDIAN_VAULT_PATH` | Absolute vault path for dataview file scans (empty disables) |
 | `OBSIDIAN_DAILY_FOLDER` | Vault-relative daily-note directory |
 | `OBSIDIAN_VAULT_NAME` | Vault name for Advanced URI links (default `My Vault`) |
 | `OBSIDIAN_AGENT_RECEIPT_FOLDER` | Where Gladys writes success receipts |
@@ -187,13 +201,16 @@ Loaded from the repo-root `.env` via pydantic-settings. The dashboard binds **lo
 | `BRIEFING_NOTE_PATH` | Optional markdown file written on each published briefing |
 | `KIKODO_CRM_*` | Optional CRM MCP paths (configured, not wired into the current UI) |
 
-Do not commit `.env`. Tokens for Hermes, Obsidian, Postgres, and Pushover live there.
+Do not commit `.env`, `hermes-rules.local`, or other `*.local` files. Root `.gitignore` also excludes `*.pem` and `*.key`. Tokens for Hermes, Obsidian, Postgres, and Pushover live in `.env`.
+
+**Local prompt rules:** copy [`hermes-rules.local.example`](hermes-rules.local.example) to `hermes-rules.local` and edit. Placeholders include `{weekday}`, `{date}`, `{human}`, `{timezone}`, `{time_of_day}`, `{is_shabbat}`, `{next_shabbat_starts_on}`. Without that file, Hermes prompts use a generic clock-only preamble.
 
 ## API surface
 
 Routers are mounted under `/api`:
 
 - `GET /api/health`
+- `GET|PUT /api/preferences/timezone`
 - `GET /api/calendar/today` and `GET /api/calendar?from=&to=`
 - `GET /api/tasks/on-deck`, `GET /api/tasks/status`, `GET /api/tasks/agent`, `POST /api/tasks`, `POST /api/tasks/{id}/complete`, `POST /api/tasks/{id}/incomplete`
 - `GET|PATCH /api/note/today`
@@ -209,11 +226,14 @@ Task complete/incomplete writes are also recorded in the `action_journal` table 
 ## Layout
 
 ```
-backend/app/          FastAPI app, routers, MCP client, services
-backend/tests/        pytest
-frontend/src/          React UI
-scripts/run.sh         venv + uvicorn
+backend/app/              FastAPI app, routers, MCP client, services
+backend/app/localtime.py  Timezone resolution + preference hydration
+backend/tests/            pytest
+frontend/src/             React UI (see frontend/README.md)
+scripts/run.sh              venv + uvicorn
 scripts/build-frontend.sh
-launchd/               launch agent plist
-.env.example           template for local secrets and paths
+scripts/resolve_lnkd.py     Optional lnkd.in → destination rewriter for Markdown notes
+launchd/                    launch agent plist
+.env.example                template for local secrets and paths
+hermes-rules.local.example  template for gitignored prompt rules
 ```
